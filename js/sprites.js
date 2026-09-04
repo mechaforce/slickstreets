@@ -3,6 +3,7 @@
 
 import { mulberry32, TAU } from './util.js';
 import { CAR_LENGTH, CAR_WIDTH } from './car.js';
+import { PICKUP_KINDS, WIRE, WHEELS, FLAME } from './pickups.js';
 
 const SS = 2; // supersample factor, for crisp edges on hi-dpi screens
 
@@ -253,6 +254,183 @@ function drawBone(ctx, w, h, rng) {
   ctx.fill();
 }
 
+function drawChar(ctx, w, h, rng) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const r = w * 0.36;
+  ctx.beginPath();
+  for (let i = 0; i <= 8; i++) {
+    const a = (i / 8) * TAU;
+    const rad = r * (0.55 + rng() * 0.6);
+    const x = cx + Math.cos(a) * rad;
+    const y = cy + Math.sin(a) * rad;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = `hsl(${20 + rng() * 14}, ${8 + rng() * 10}%, ${8 + rng() * 7}%)`;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  // Embers still glowing in the ash.
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = `hsla(${18 + rng() * 22}, 90%, ${45 + rng() * 20}%, ${0.35 + rng() * 0.4})`;
+    ctx.beginPath();
+    ctx.arc(cx + (rng() - 0.5) * r, cy + (rng() - 0.5) * r, 0.8 + rng() * 1.4, 0, TAU);
+    ctx.fill();
+  }
+}
+
+/** The crate an upgrade sits in, with its own icon on the lid. */
+function drawPickup(ctx, w, h, kind) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const colour = PICKUP_KINDS[kind].colour;
+  const box = 26;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  roundRect(ctx, cx - box / 2 + 3, cy - box / 2 + 5, box, box, 4);
+  ctx.fill();
+
+  ctx.fillStyle = '#23252c';
+  roundRect(ctx, cx - box / 2, cy - box / 2, box, box, 4);
+  ctx.fill();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.strokeStyle = colour;
+  ctx.fillStyle = colour;
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = 'round';
+
+  if (kind === WIRE) {
+    // A coil of wire seen end-on, with barbs.
+    ctx.beginPath();
+    ctx.arc(0, 0, 7, 0, TAU);
+    ctx.stroke();
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 4.5, Math.sin(a) * 4.5);
+      ctx.lineTo(Math.cos(a) * 10, Math.sin(a) * 10);
+      ctx.stroke();
+    }
+  } else if (kind === WHEELS) {
+    // A fat tyre with tread blocks.
+    ctx.beginPath();
+    ctx.arc(0, 0, 8.5, 0, TAU);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(0, 0, 3.4, 0, TAU);
+    ctx.stroke();
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * TAU;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 6, Math.sin(a) * 6);
+      ctx.lineTo(Math.cos(a) * 8.5, Math.sin(a) * 8.5);
+      ctx.stroke();
+    }
+  } else {
+    // A flame.
+    ctx.beginPath();
+    ctx.moveTo(0, -10);
+    ctx.quadraticCurveTo(7, -2, 4.5, 4);
+    ctx.quadraticCurveTo(3, 9, 0, 10);
+    ctx.quadraticCurveTo(-3, 9, -4.5, 4);
+    ctx.quadraticCurveTo(-7, -2, 0, -10);
+    ctx.fill();
+    ctx.fillStyle = '#2a1206';
+    ctx.beginPath();
+    ctx.moveTo(0, -2);
+    ctx.quadraticCurveTo(3, 2, 1.5, 6);
+    ctx.quadraticCurveTo(0, 8, -1.5, 6);
+    ctx.quadraticCurveTo(-3, 2, 0, -2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** Oversized tyres, drawn underneath the car while the upgrade is running. */
+function drawBigWheels(ctx, w, h) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const off = CAR_WIDTH * 0.5 * 1.75;
+  ctx.fillStyle = '#101116';
+  ctx.strokeStyle = '#2e3038';
+  ctx.lineWidth = 1.5;
+  for (const sx of [0.30, -0.30]) {
+    for (const sy of [1, -1]) {
+      const x = cx + sx * CAR_LENGTH - 11;
+      const y = cy + sy * off - 8;
+      roundRect(ctx, x, y, 22, 16, 5);
+      ctx.fill();
+      ctx.stroke();
+      // Tread.
+      ctx.strokeStyle = 'rgba(150,155,170,0.30)';
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath();
+        ctx.moveTo(x + 3 + i * 5, y + 2);
+        ctx.lineTo(x + 3 + i * 5, y + 14);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = '#2e3038';
+    }
+  }
+}
+
+/** Barbed wire wrapped round the bodywork, drawn over the car. */
+function drawWire(ctx, w, h) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const L = CAR_LENGTH;
+  const W = CAR_WIDTH;
+  ctx.strokeStyle = '#cfe0e8';
+  ctx.lineWidth = 1.6;
+  roundRect(ctx, cx - L / 2 - 1, cy - W / 2 - 1, L + 2, W + 2, 8);
+  ctx.stroke();
+
+  // Barbs round the perimeter.
+  ctx.lineWidth = 1.3;
+  const barbs = 22;
+  for (let i = 0; i < barbs; i++) {
+    const t = i / barbs;
+    let x;
+    let y;
+    let nx;
+    let ny;
+    if (t < 0.5) {
+      x = cx - L / 2 + L * (t * 2);
+      y = cy - W / 2 - 1;
+      nx = 0;
+      ny = -1;
+    } else {
+      x = cx + L / 2 - L * ((t - 0.5) * 2);
+      y = cy + W / 2 + 1;
+      nx = 0;
+      ny = 1;
+    }
+    ctx.beginPath();
+    ctx.moveTo(x - 2.5, y - ny * 1.5);
+    ctx.lineTo(x + 2.5, y + ny * 3.5);
+    ctx.moveTo(x + 2.5, y - ny * 1.5);
+    ctx.lineTo(x - 2.5, y + ny * 3.5);
+    ctx.stroke();
+  }
+  // And across the nose, where most of the shredding happens.
+  for (let i = 0; i < 4; i++) {
+    const y = cy - W / 2 + 4 + i * ((W - 8) / 3);
+    ctx.beginPath();
+    ctx.moveTo(cx + L / 2 - 2, y - 2.5);
+    ctx.lineTo(cx + L / 2 + 4, y + 2.5);
+    ctx.moveTo(cx + L / 2 + 4, y - 2.5);
+    ctx.lineTo(cx + L / 2 - 2, y + 2.5);
+    ctx.stroke();
+  }
+}
+
 export function makeSprites() {
   const rng = mulberry32(1337);
 
@@ -286,5 +464,34 @@ export function makeSprites() {
     bone.push(b.canvas);
   }
 
-  return { car: car.canvas, zombies, skeletons, meat, bone, enemySize: ENEMY, rng };
+  const char = [];
+  for (let i = 0; i < 6; i++) {
+    const c = makeCanvas(26, 26);
+    drawChar(c.ctx, 26, 26, mulberry32(900 + i));
+    char.push(c.canvas);
+  }
+
+  const pickups = [];
+  for (let k = 0; k < PICKUP_KINDS.length; k++) {
+    const c = makeCanvas(44, 44);
+    drawPickup(c.ctx, 44, 44, k);
+    pickups.push(c.canvas);
+  }
+
+  const wheelPad = 14;
+  const bigWheels = makeCanvas(CAR_LENGTH + carPad * 2, CAR_WIDTH * 1.75 + wheelPad * 2);
+  drawBigWheels(bigWheels.ctx, bigWheels.canvas.w, bigWheels.canvas.h);
+
+  const wire = makeCanvas(CAR_LENGTH + carPad * 2, CAR_WIDTH + carPad * 2);
+  drawWire(wire.ctx, wire.canvas.w, wire.canvas.h);
+
+  return {
+    car: car.canvas,
+    zombies, skeletons, meat, bone, char,
+    pickups,
+    bigWheels: bigWheels.canvas,
+    wire: wire.canvas,
+    enemySize: ENEMY,
+    rng,
+  };
 }

@@ -156,15 +156,20 @@ export function applyImpact(car, nx, ny) {
   return lost;
 }
 
-/** Circle-vs-oriented-box test used for running things over. */
-export function overlapsCar(car, x, y, r) {
+/**
+ * Circle-vs-oriented-box test used for running things over. `widthScale`
+ * widens the crush footprint without widening the car itself, which is what
+ * the big wheels do: a broader path through the horde, same body to squeeze
+ * down the same streets.
+ */
+export function overlapsCar(car, x, y, r, widthScale = 1) {
   const dx = x - car.x;
   const dy = y - car.y;
   const cos = Math.cos(car.ang);
   const sin = Math.sin(car.ang);
   const lx = dx * cos + dy * sin;
   const ly = -dx * sin + dy * cos;
-  return Math.abs(lx) < CAR_LENGTH * 0.5 + r && Math.abs(ly) < CAR_WIDTH * 0.5 + r;
+  return Math.abs(lx) < CAR_LENGTH * 0.5 + r && Math.abs(ly) < CAR_WIDTH * 0.5 * widthScale + r;
 }
 
 /** World-space point of the two collision circles approximating the body. */

@@ -7,7 +7,7 @@
 // The modules stay the source of truth; this only concatenates them in
 // dependency order, strips the import/export keywords, and wraps the result.
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -18,6 +18,7 @@ const ORDER = [
   'util.js',
   'spatialhash.js',
   'city.js',
+  'pickups.js',
   'car.js',
   'enemies.js',
   'gore.js',
@@ -60,6 +61,18 @@ function checkCollisions(modules) {
     }
   }
   return seen.size;
+}
+
+// A module missing from ORDER would be silently dropped from the bundle and
+// only fail at runtime, so refuse to build until it is placed deliberately.
+const present = (await readdir(join(root, 'js'))).filter((f) => f.endsWith('.js')).sort();
+const missing = present.filter((f) => !ORDER.includes(f));
+const stale = ORDER.filter((f) => !present.includes(f));
+if (missing.length > 0) {
+  throw new Error(`js/${missing.join(', js/')} not listed in ORDER - add it in dependency order`);
+}
+if (stale.length > 0) {
+  throw new Error(`ORDER lists files that no longer exist: ${stale.join(', ')}`);
 }
 
 const modules = [];

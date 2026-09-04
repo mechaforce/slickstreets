@@ -76,9 +76,13 @@ function drainEvents() {
   for (const ev of game.events) {
     switch (ev.type) {
       case 'kill':
-        if (ev.kind === ZOMBIE) audio.splat(ev.speed);
+        if (ev.shredded) audio.shred();
+        else if (ev.burned) break;      // the flame's own whoosh covers these
+        else if (ev.kind === ZOMBIE) audio.splat(ev.speed);
         else audio.bone();
         break;
+      case 'pickup': audio.pickup(); break;
+      case 'flame': audio.flame(); break;
       case 'crash': audio.crash(ev.force); break;
       case 'shift': audio.shift(); break;
       case 'death':

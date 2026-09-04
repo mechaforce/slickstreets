@@ -146,6 +146,41 @@ export class GameAudio {
     this._noiseBurst(1.2, 160, 'lowpass', 0.4);
   }
 
+  /** Bright two-note chime when you drive over a crate. */
+  pickup() {
+    if (!this.started || this.muted) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    for (const [freq, delay] of [[660, 0], [990, 0.09]]) {
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.setValueAtTime(freq, t + delay);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t + delay);
+      g.gain.exponentialRampToValueAtTime(0.22, t + delay + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + delay + 0.26);
+      o.connect(g);
+      g.connect(this.master);
+      o.start(t + delay);
+      o.stop(t + delay + 0.3);
+    }
+  }
+
+  /** The whoosh of the flamethrower letting go. */
+  flame() {
+    if (!this.started || this.muted) return;
+    this._noiseBurst(0.55, 900, 'bandpass', 0.26, 1);
+    this._noiseBurst(0.5, 240, 'lowpass', 0.18, 1);
+  }
+
+  /** Meat tearing on the wire - drier and thinner than a full splat. */
+  shred() {
+    if (!this.started || this.muted) return;
+    if (this.hitsThisFrame >= MAX_HITS_PER_FRAME) return;
+    this.hitsThisFrame++;
+    this._noiseBurst(0.1, 1800, 'bandpass', 0.13, 0.8);
+  }
+
   toggleMute() {
     this.muted = !this.muted;
     if (this.started) {

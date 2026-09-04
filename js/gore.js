@@ -12,6 +12,7 @@ export const MAX_CHUNKS = 3200;
 
 export const MEAT = 0;
 export const BONE = 1;
+export const CHAR = 2;
 
 export class GoreField {
   constructor(seed = 1) {
@@ -61,7 +62,7 @@ export class GoreField {
       c.y = y + rr(rng, -6, 6);
       c.vx = Math.cos(a) * sp;
       c.vy = Math.sin(a) * sp;
-      c.r = kind === BONE ? rr(rng, 3, 6.5) : rr(rng, 4.5, 11);
+      c.r = kind === MEAT ? rr(rng, 4.5, 11) : rr(rng, 3, 6.5);
       c.rot = rr(rng, 0, TAU);
       c.spin = rr(rng, -6, 6);
       c.type = kind;
@@ -72,7 +73,7 @@ export class GoreField {
     }
     this.splats.push({
       x, y,
-      r: (kind === BONE ? 22 : 34) + power * 0.06,
+      r: (kind === MEAT ? 34 : 22) + power * 0.06,
       tone: this.rng(),
       kind,
       dirx, diry,
@@ -139,12 +140,12 @@ export class GoreField {
    * Shove chunks out of the car's footprint and report how clogged the car is.
    * Returns 0..1 gore drag.
    */
-  plough(car) {
+  plough(car, widthScale = 1) {
     const cos = Math.cos(car.ang);
     const sin = Math.sin(car.ang);
     const speed = Math.abs(car.speed);
     const reach = CAR_LENGTH * 0.7;
-    const q = this.hash.query(car.x, car.y, reach + 14, this._q);
+    const q = this.hash.query(car.x, car.y, reach + 14 + CAR_WIDTH * (widthScale - 1), this._q);
     let touching = 0;
 
     for (let i = 0; i < q.length; i++) {
@@ -155,7 +156,7 @@ export class GoreField {
       const lx = dx * cos + dy * sin;
       const ly = -dx * sin + dy * cos;
       const hx = CAR_LENGTH * 0.5 + c.r;
-      const hy = CAR_WIDTH * 0.5 + c.r;
+      const hy = CAR_WIDTH * 0.5 * widthScale + c.r;
       if (Math.abs(lx) > hx || Math.abs(ly) > hy) continue;
 
       touching++;

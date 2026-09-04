@@ -31,6 +31,19 @@ out of that:
 Zombies are slow, heavy and clog the car. Skeletons are quick and brittle: they
 die at lower speed but they reach you first and claw harder.
 
+## Upgrades
+
+Crates sit out on the road all over the city — roughly 320 of them, marked on
+the minimap in their own colour. Drive over one and it bolts on for about 25
+seconds, then falls off again. Collecting one puts a replacement somewhere far
+away, so the map never runs dry and there is always somewhere to be going.
+
+| | |
+|---|---|
+| **Barbed wire** | Anything touching the bodywork tears itself open on it — a chance per second of being shredded, whatever your speed. Also halves what the ones still clinging on can do to you, which makes it the upgrade that saves you when you have already been stopped. |
+| **Big wheels** | Widens the crushing footprint to 1.75× without widening the car, so you clear a much broader path through the horde and still fit down the same streets. |
+| **Flamethrower** | Every 3–5 seconds it sprays a cone off the nose and burns everything in it, whatever your speed. What it kills leaves charred remains and black scorch marks instead of blood, so you can read where you have used it. |
+
 ## Controls
 
 | Key | |
@@ -73,6 +86,13 @@ rather than instantly fatal, that the car shoves gore aside instead of driving
 through it, and that a scripted bot can survive and rack up kills. It also
 holds the sim to a frame budget with a couple of thousand enemies alive.
 
+The upgrades are covered the same way: that crates are spread across the whole
+map and never buried in a building, that driving over one arms it and restocks
+the map, that the wire both shreds and blunts, that the big wheels crush
+something the bare car misses while the car itself stays the same size, and
+that the flamethrower burns a cone off the nose — and nothing behind it,
+beside it, or out of range — on a 3-5 second cadence.
+
 ## Layout
 
 ```
@@ -83,6 +103,7 @@ js/
   car.js           pure arcade physics and the gearbox
   enemies.js       the horde: pooling, steering, separation, spawning
   gore.js          pushable chunks
+  pickups.js       upgrade crates scattered over the map
   game.js          owns the world, steps it, emits events
   sprites.js       every sprite drawn once into an offscreen canvas
   render.js        camera, pseudo-3D city, decal-baked blood, HUD

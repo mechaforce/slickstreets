@@ -3,8 +3,9 @@
 import { CELL, ROAD } from './city.js';
 import { CAR_LENGTH, CAR_WIDTH, GEARS, GEAR_LOW, GEAR_HIGH, KMH_PER_PX, PX_PER_METRE } from './car.js';
 import { ZOMBIE } from './enemies.js';
-import { MEAT } from './gore.js';
+import { MEAT, BONE } from './gore.js';
 import { MAX_HEALTH } from './game.js';
+import { PICKUP_KINDS, PICKUP_RADIUS, WIRE, WHEELS, FLAME } from './pickups.js';
 import { clamp, lerp, TAU, mulberry32 } from './util.js';
 
 const ROAD_COLOR = '#26272d';
@@ -87,22 +88,24 @@ class DecalLayer {
       streaks.push([s.x + dx * dist, s.y + dy * dist, r * (0.07 + rng() * 0.16)]);
     }
 
-    const bone = s.kind !== MEAT;
-    const hue = bone ? 40 : 356;
-    const sat = bone ? 18 : 62;
-    const light = bone ? 60 : 15 + s.tone * 8;
+    // Blood, bone dust, or the black scorch the flamethrower leaves.
+    const scorch = s.kind !== MEAT && s.kind !== BONE;
+    const bone = s.kind === BONE;
+    const hue = scorch ? 24 : bone ? 40 : 356;
+    const sat = scorch ? 12 : bone ? 18 : 62;
+    const light = scorch ? 6 : bone ? 60 : 15 + s.tone * 8;
 
     for (let ty = y0; ty <= y1; ty++) {
       for (let tx = x0; tx <= x1; tx++) {
         const t = this._tile(tx, ty, frame);
         const ctx = t.ctx;
-        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light}%, ${bone ? 0.28 : 0.5})`;
+        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light}%, ${bone ? 0.28 : scorch ? 0.55 : 0.5})`;
         for (const [bx, by, br] of blobs) {
           ctx.beginPath();
           ctx.arc(bx, by, br, 0, TAU);
           ctx.fill();
         }
-        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light + 4}%, ${bone ? 0.2 : 0.38})`;
+        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light + 4}%, ${bone ? 0.2 : scorch ? 0.4 : 0.38})`;
         for (const [sx, sy, sr] of streaks) {
           ctx.beginPath();
           ctx.arc(sx, sy, sr, 0, TAU);
@@ -141,6 +144,7 @@ export class Renderer {
     this.shiftHint = 0;
     this.view = { x: 0, y: 0, w: 0, h: 0 };
     this.gradients = null;
+    this._pickupQ = [];
     this.resize();
   }
 
@@ -234,6 +238,8 @@ export class Renderer {
     game.gore.splats.length = 0;
     this.decals.draw(ctx, view, this.frame);
     this.drawGore(game, view);
+    this.drawPickups(game, view);
+    this.drawFlame(game);
     this.drawParticles(game, view);
     this.drawEnemies(game, view);
     this.drawCar(game);
@@ -411,7 +417,8 @@ export class Renderer {
       const c = chunks[i];
       if (!c.live) continue;
       if (c.x < vx0 || c.x > vx1 || c.y < vy0 || c.y > vy1) continue;
-      const img = c.type === MEAT ? sp.meat[c.shape % sp.meat.length] : sp.bone[c.shape % sp.bone.length];
+      const set = c.type === MEAT ? sp.meat : c.type === BONE ? sp.bone : sp.char;
+      const img = set[c.shape % set.length];
       const s = c.r * 3.0;
       const cos = Math.cos(c.rot);
       const sin = Math.sin(c.rot);
@@ -424,6 +431,66 @@ export class Renderer {
     this.worldTransform(game);
   }
 
+  drawPickups(game, view) {
+    const ctx = this.ctx;
+    const sp = this.sprites;
+    const list = game.pickups.nearby(
+      view.x + view.w * 0.5, view.y + view.h * 0.5,
+      Math.max(view.w, view.h) * 0.5 + CELL, this._pickupQ,
+    );
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!p.alive) continue;
+      if (p.x < view.x || p.x > view.x + view.w || p.y < view.y || p.y > view.y + view.h) continue;
+      const kind = PICKUP_KINDS[p.kind];
+      const pulse = 0.5 + 0.5 * Math.sin(p.phase);
+
+      // A glow on the tarmac so a crate is spottable down a long street.
+      ctx.save();
+      ctx.globalAlpha = 0.16 + pulse * 0.16;
+      ctx.fillStyle = kind.colour;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, PICKUP_RADIUS + 12 + pulse * 5, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+
+      const img = sp.pickups[p.kind];
+      const bob = Math.sin(p.phase) * 2;
+      ctx.drawImage(img, p.x - img.w * 0.5, p.y - img.h * 0.5 + bob, img.w, img.h);
+    }
+  }
+
+  drawFlame(game) {
+    if (game.flameSpray <= 0) return;
+    const ctx = this.ctx;
+    const car = game.car;
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+    const mx = car.x + cos * CAR_LENGTH * 0.5;
+    const my = car.y + sin * CAR_LENGTH * 0.5;
+    // Flicker the reach and spread a little so the jet never looks like a
+    // static triangle stuck to the bumper.
+    const flick = 0.86 + 0.1 * Math.sin(this.frame * 0.9) + Math.random() * 0.08;
+    const range = 205 * flick;
+    const half = 0.44 * (0.92 + Math.random() * 0.14);
+
+    const g = ctx.createRadialGradient(mx, my, 6, mx, my, range);
+    g.addColorStop(0, 'rgba(255,248,214,0.85)');
+    g.addColorStop(0.28, 'rgba(255,164,48,0.55)');
+    g.addColorStop(0.7, 'rgba(214,68,20,0.22)');
+    g.addColorStop(1, 'rgba(120,24,8,0)');
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(mx, my);
+    ctx.arc(mx, my, range, car.ang - half, car.ang + half);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
   drawParticles(game, view) {
     const ctx = this.ctx;
     const arr = game.particles;
@@ -434,8 +501,13 @@ export class Renderer {
       const a = clamp(p.life / p.max, 0, 1);
       if (p.kind === 0) ctx.fillStyle = `hsla(356, 70%, ${22 + p.tone * 14}%, ${a})`;
       else if (p.kind === 1) ctx.fillStyle = `hsla(44, 20%, ${72 + p.tone * 12}%, ${a})`;
-      else ctx.fillStyle = `hsla(38, 95%, ${60 + p.tone * 25}%, ${a})`;
-      const s = p.size * (0.5 + a * 0.7);
+      else if (p.kind === 3) {
+        // Fire cools from white-yellow through orange to a dull red as it dies.
+        ctx.fillStyle = `hsla(${8 + a * 46}, 100%, ${34 + a * 44}%, ${0.35 + a * 0.65})`;
+      } else if (p.kind === 4) {
+        ctx.fillStyle = `hsla(24, 6%, ${28 + p.tone * 14}%, ${a * 0.4})`;
+      } else ctx.fillStyle = `hsla(38, 95%, ${60 + p.tone * 25}%, ${a})`;
+      const s = p.size * (p.kind === 4 ? 1.4 - a * 0.5 : 0.5 + a * 0.7);
       ctx.fillRect(p.x - s * 0.5, p.y - s * 0.5, s, s);
     }
   }
@@ -453,7 +525,16 @@ export class Renderer {
     ctx.setTransform(z * cos, z * sin, -z * sin, z * cos, car.x * z + ox, car.y * z + oy);
     ctx.fillStyle = 'rgba(0,0,0,0.38)';
     ctx.fillRect(-CAR_LENGTH * 0.5 + 5, -CAR_WIDTH * 0.5 + 7, CAR_LENGTH, CAR_WIDTH);
+
+    if (game.has(WHEELS)) {
+      const bw = this.sprites.bigWheels;
+      ctx.drawImage(bw, -bw.w * 0.5, -bw.h * 0.5, bw.w, bw.h);
+    }
     ctx.drawImage(img, -img.w * 0.5, -img.h * 0.5, img.w, img.h);
+    if (game.has(WIRE)) {
+      const wr = this.sprites.wire;
+      ctx.drawImage(wr, -wr.w * 0.5, -wr.h * 0.5, wr.w, wr.h);
+    }
     this.worldTransform(game);
   }
 
@@ -491,6 +572,8 @@ export class Renderer {
     this.drawStats(game);
     this.drawSpeedo(game, dt);
     this.drawPressure(game, dt);
+    this.drawUpgrades(game);
+    this.drawPickupToast(game);
     this.drawMinimap(game);
 
     if (game.combo >= 3) {
@@ -648,6 +731,75 @@ export class Renderer {
     ctx.fillText('SWARM PRESSURE', this.w / 2, y - 8);
   }
 
+  /** Chips in the top-right for whatever is currently bolted to the car. */
+  drawUpgrades(game) {
+    const ctx = this.ctx;
+    const w = 186;
+    const x = this.w - w - 22;
+    let y = 24;
+
+    for (let kind = 0; kind < PICKUP_KINDS.length; kind++) {
+      const left = game.power[kind];
+      if (left <= 0) continue;
+      const def = PICKUP_KINDS[kind];
+      const frac = clamp(left / def.duration, 0, 1);
+      // Flash the chip when it is nearly out.
+      const dying = left < 5 ? 0.45 + 0.55 * Math.abs(Math.sin(this.frame * 0.2)) : 1;
+
+      ctx.save();
+      ctx.globalAlpha = dying;
+      ctx.fillStyle = 'rgba(10,11,14,0.78)';
+      ctx.fillRect(x, y, w, 34);
+      ctx.fillStyle = def.colour;
+      ctx.fillRect(x, y, 4, 34);
+
+      ctx.textAlign = 'left';
+      ctx.font = '600 12px ui-monospace, Menlo, monospace';
+      ctx.fillStyle = def.colour;
+      ctx.fillText(def.name, x + 12, y + 15);
+
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.fillText(`${Math.ceil(left)}s`, x + w - 10, y + 15);
+
+      // Time remaining.
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.fillRect(x + 12, y + 22, w - 24, 5);
+      ctx.fillStyle = def.colour;
+      ctx.fillRect(x + 12, y + 22, (w - 24) * frac, 5);
+
+      // The flamethrower also shows how long until the next burst.
+      if (kind === FLAME) {
+        const ready = 1 - clamp(game.flameCooldown / 5, 0, 1);
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        ctx.fillRect(x + 12, y + 29, (w - 24) * ready, 2);
+      }
+      ctx.restore();
+      y += 42;
+    }
+  }
+
+  /** Big confirmation of what you just drove over. */
+  drawPickupToast(game) {
+    if (game.lastPickup < 0 || game.lastPickupAge > 2.2) return;
+    const ctx = this.ctx;
+    const def = PICKUP_KINDS[game.lastPickup];
+    const t = game.lastPickupAge;
+    const fade = t < 1.5 ? 1 : 1 - (t - 1.5) / 0.7;
+    const rise = Math.min(1, t / 0.25);
+
+    ctx.save();
+    ctx.globalAlpha = clamp(fade, 0, 1);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = def.colour;
+    ctx.font = `700 ${34 + (1 - rise) * 16}px Impact, "Arial Narrow", sans-serif`;
+    ctx.fillText(def.name, this.w / 2, this.h * 0.26);
+    ctx.font = '600 13px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText(def.blurb, this.w / 2, this.h * 0.26 + 22);
+    ctx.restore();
+  }
+
   drawMinimap(game) {
     const ctx = this.ctx;
     const size = 168;
@@ -688,6 +840,18 @@ export class Renderer {
     for (let i = 0; i < list.length; i += 3) {
       const e = list[i];
       ctx.fillRect(e.x - 14, e.y - 14, 28, 28);
+    }
+
+    // Crates worth driving to.
+    const crates = game.pickups.nearby(car.x, car.y, range, this._pickupQ);
+    for (let i = 0; i < crates.length; i++) {
+      const p = crates[i];
+      if (!p.alive) continue;
+      // Outlined so a crate marker never reads as part of the red horde.
+      ctx.fillStyle = 'rgba(0,0,0,0.85)';
+      ctx.fillRect(p.x - 62, p.y - 62, 124, 124);
+      ctx.fillStyle = PICKUP_KINDS[p.kind].colour;
+      ctx.fillRect(p.x - 44, p.y - 44, 88, 88);
     }
 
     // You.

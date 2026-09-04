@@ -7,7 +7,8 @@ import {
   BODY_RADIUS, GEAR_LOW, GEAR_HIGH, GEARS, toggleGear, CAR_LENGTH, PX_PER_METRE,
 } from './car.js';
 import { Swarm, KINDS, ZOMBIE, SKELETON } from './enemies.js';
-import { GoreField, MEAT, BONE } from './gore.js';
+import { GoreField, MEAT, BONE, CHAR } from './gore.js';
+import { PickupField, PICKUP_KINDS, WIRE, WHEELS, FLAME } from './pickups.js';
 import { clamp, rr, mulberry32, TAU } from './util.js';
 
 export const MAX_HEALTH = 100;
@@ -20,6 +21,18 @@ const COMBO_WINDOW = 1.4;
 const RAMP_SECONDS = 260;   // time to reach maximum horde density
 
 const MAX_PARTICLES = 900;
+
+/** Chance per second that any one enemy touching the wire is shredded by it. */
+const WIRE_SHRED_RATE = 0.9;
+/** Anything busy tearing itself open on the wire is not clawing at you. */
+const WIRE_DAMAGE_SCALE = 0.5;
+/** How much wider the big wheels make the crushing footprint. */
+const WHEEL_WIDTH_SCALE = 1.75;
+/** Flamethrower: seconds between bursts, and how long each burst sprays. */
+const FLAME_GAP = [3, 5];
+const FLAME_SPRAY = 0.6;
+const FLAME_RANGE = 205;
+const FLAME_HALF_ANGLE = 0.44;
 
 export class Game {
   constructor(seed = Date.now()) {
@@ -43,6 +56,7 @@ export class Game {
     this.city = generateCity(this.seed, 40, 40);
     this.swarm = new Swarm(this.city, this.seed);
     this.gore = new GoreField(this.seed);
+    this.pickups = new PickupField(this.city, this.seed);
 
     // Start on an intersection near the middle of the map.
     const c = this.city.cell;
@@ -68,6 +82,15 @@ export class Game {
     this.hurtTimer = 0;
     this.shake = 0;
     this.deathCause = '';
+    // Seconds remaining on each vehicle upgrade, indexed by pickup kind.
+    this.power = [0, 0, 0];
+    this.flameCooldown = 0;
+    this.flameSpray = 0;
+    this.lastPickup = -1;
+    this.lastPickupAge = 99;
+    this.shredKills = 0;
+    this.burnKills = 0;
+    this._collected = [];
     for (const p of this.particles) p.live = false;
     this.events.length = 0;
     this._seedAttractHorde();
@@ -101,6 +124,16 @@ export class Game {
     this.events.push({ type: 'start' });
   }
 
+  /** True while the given pickup kind is active. */
+  has(kind) {
+    return this.power[kind] > 0;
+  }
+
+  /** How wide a path the car currently crushes, in body widths. */
+  get crushWidth() {
+    return this.has(WHEELS) ? WHEEL_WIDTH_SCALE : 1;
+  }
+
   get difficulty() {
     return clamp(this.time / RAMP_SECONDS, 0, 1);
   }
@@ -124,6 +157,69 @@ export class Game {
     this.events.push({ type: 'shift', gear: toggleGear(this.car) });
   }
 
+  /** Kill one enemy, spray the matching gore, and bank the score for it. */
+  killEnemy(e, dirx, diry, power, goreKind, amount) {
+    const k = KINDS[e.kind];
+    this.gore.burst(e.x, e.y, dirx, diry, power, goreKind, amount);
+    this.swarm.kill(e);
+    this.kills++;
+    if (e.kind === ZOMBIE) this.zombieKills++; else this.skeletonKills++;
+    this.combo++;
+    this.comboTimer = COMBO_WINDOW;
+    if (this.combo > this.bestCombo) this.bestCombo = this.combo;
+    this.score += Math.round(10 * (1 + Math.min(this.combo, 40) * 0.05));
+    return k;
+  }
+
+  /** The flamethrower's cone, swept every frame while it is spraying. */
+  burn(dt) {
+    const car = this.car;
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+    const mx = car.x + cos * CAR_LENGTH * 0.5;
+    const my = car.y + sin * CAR_LENGTH * 0.5;
+
+    const q = this.swarm.query(mx + cos * FLAME_RANGE * 0.5, my + sin * FLAME_RANGE * 0.5,
+      FLAME_RANGE, this._q);
+    for (let i = 0; i < q.length; i++) {
+      const e = q[i];
+      if (!e.alive) continue;
+      const dx = e.x - mx;
+      const dy = e.y - my;
+      const d = Math.hypot(dx, dy);
+      if (d > FLAME_RANGE) continue;
+      // Inside the cone? Everything close to the muzzle counts.
+      if (d > 26 && (dx * cos + dy * sin) / d < Math.cos(FLAME_HALF_ANGLE)) continue;
+      this.killEnemy(e, dx / (d || 1), dy / (d || 1), 120, CHAR, 3);
+      this.burnKills++;
+      this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed: 0, burned: true });
+      for (let s2 = 0; s2 < 3; s2++) {
+        this.emitParticle(e.x, e.y, rr(this.rng, -60, 60), rr(this.rng, -60, 60),
+          rr(this.rng, 0.3, 0.7), rr(this.rng, 2, 5), 3, this.rng());
+      }
+    }
+
+    // The spray itself.
+    const jets = 7;
+    for (let i = 0; i < jets; i++) {
+      const a = car.ang + rr(this.rng, -FLAME_HALF_ANGLE, FLAME_HALF_ANGLE);
+      const sp = rr(this.rng, 260, 620);
+      this.emitParticle(
+        mx + rr(this.rng, -4, 4), my + rr(this.rng, -4, 4),
+        Math.cos(a) * sp + car.vx * 0.5, Math.sin(a) * sp + car.vy * 0.5,
+        rr(this.rng, 0.22, 0.5), rr(this.rng, 3, 7), 3, this.rng(),
+      );
+      if (this.rng() < 0.4) {
+        this.emitParticle(
+          mx + Math.cos(a) * 60, my + Math.sin(a) * 60,
+          Math.cos(a) * sp * 0.3 + rr(this.rng, -40, 40),
+          Math.sin(a) * sp * 0.3 + rr(this.rng, -40, 40),
+          rr(this.rng, 0.5, 1.1), rr(this.rng, 4, 9), 4, this.rng(),
+        );
+      }
+    }
+  }
+
   update(dt, input) {
     this.events.length = 0;
     if (this.state !== 'playing') {
@@ -139,6 +235,21 @@ export class Game {
     const px = car.x;
     const py = car.y;
 
+    // Upgrades run down, and driving over a crate tops one back up.
+    for (let i = 0; i < this.power.length; i++) {
+      if (this.power[i] > 0) this.power[i] = Math.max(0, this.power[i] - dt);
+    }
+    this.lastPickupAge += dt;
+    this.pickups.update(dt, car, this._collected);
+    for (const kind of this._collected) {
+      this.power[kind] = PICKUP_KINDS[kind].duration;
+      this.lastPickup = kind;
+      this.lastPickupAge = 0;
+      // Fire the first burst almost at once, so picking it up feels like something.
+      if (kind === FLAME) this.flameCooldown = Math.min(this.flameCooldown, 0.5);
+      this.events.push({ type: 'pickup', kind });
+    }
+
     this.swarm.update(dt, car, this.difficulty);
 
     // ---- run them over ------------------------------------------------
@@ -153,6 +264,9 @@ export class Game {
     const cos = Math.cos(car.ang);
     const sin = Math.sin(car.ang);
 
+    const crushWidth = this.crushWidth;
+    const wired = this.has(WIRE);
+
     for (let i = 0; i < q.length; i++) {
       const e = q[i];
       if (!e.alive) continue;
@@ -165,13 +279,15 @@ export class Game {
         crowd += (1 - d / CROWD_RADIUS) * k.drag;
       }
 
-      if (!overlapsCar(car, e.x, e.y, e.r)) continue;
+      // The wide footprint decides what gets crushed; only what is actually
+      // against the bodywork can grab you or catch on the wire.
+      if (!overlapsCar(car, e.x, e.y, e.r, crushWidth)) continue;
 
       if (speed >= k.killSpeed) {
         // Splat. Throw the gore forward along the car's heading.
         const dirx = car.vx / (speed || 1);
         const diry = car.vy / (speed || 1);
-        this.gore.burst(e.x, e.y, dirx, diry, speed, e.kind === ZOMBIE ? MEAT : BONE, k.gore);
+        this.killEnemy(e, dirx, diry, speed, e.kind === ZOMBIE ? MEAT : BONE, k.gore);
         for (let s = 0; s < 4; s++) {
           this.emitParticle(
             e.x, e.y,
@@ -181,22 +297,23 @@ export class Game {
             e.kind === ZOMBIE ? 0 : 1, this.rng(),
           );
         }
-        this.swarm.kill(e);
         killsThisFrame++;
         massKilled += k.mass;
-        this.kills++;
-        if (e.kind === ZOMBIE) this.zombieKills++; else this.skeletonKills++;
-        this.combo++;
-        this.comboTimer = COMBO_WINDOW;
-        if (this.combo > this.bestCombo) this.bestCombo = this.combo;
-        this.score += Math.round(10 * (1 + Math.min(this.combo, 40) * 0.05));
         this.shake = Math.min(this.shake + 0.5 + speed * 0.004, 9);
         this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed });
-      } else {
-        // Too slow to kill it - now it is clawing at the doors.
-        const bite = clamp(1 - speed / k.killSpeed, 0, 1);
-        grabDamage += k.damage * bite;
-        grabbers++;
+      } else if (overlapsCar(car, e.x, e.y, e.r)) {
+        if (wired && this.rng() < WIRE_SHRED_RATE * dt) {
+          // Caught on the barbed wire and torn apart against the bodywork.
+          const inv = 1 / (d || 1);
+          this.killEnemy(e, dx * inv, dy * inv, 90, MEAT, 4);
+          this.shredKills++;
+          this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed, shredded: true });
+        } else {
+          // Too slow to kill it - now it is clawing at the doors.
+          const bite = clamp(1 - speed / k.killSpeed, 0, 1);
+          grabDamage += k.damage * bite * (wired ? WIRE_DAMAGE_SCALE : 1);
+          grabbers++;
+        }
       }
     }
 
@@ -255,9 +372,23 @@ export class Game {
       }
     }
 
+    // ---- flamethrower ----------------------------------------------------
+    if (this.has(FLAME)) {
+      this.flameCooldown -= dt;
+      if (this.flameCooldown <= 0) {
+        this.flameCooldown = rr(this.rng, FLAME_GAP[0], FLAME_GAP[1]);
+        this.flameSpray = FLAME_SPRAY;
+        this.events.push({ type: 'flame' });
+      }
+    }
+    if (this.flameSpray > 0) {
+      this.flameSpray -= dt;
+      this.burn(dt);
+    }
+
     // ---- gore -----------------------------------------------------------
     this.gore.update(dt);
-    this.goreDrag = this.gore.plough(car);
+    this.goreDrag = this.gore.plough(car, crushWidth);
 
     // ---- damage and healing ---------------------------------------------
     if (grabDamage > 0) {
