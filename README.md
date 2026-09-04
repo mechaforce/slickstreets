@@ -1,0 +1,111 @@
+# Slick Streets
+
+A top-down driving game. You have a car, a city, and an unreasonable number of
+zombies and skeletons who all want to be where you are.
+
+**[Play the standalone build](dist/slick-streets.html)** — one file, no server,
+open it in a browser.
+
+## The idea
+
+The horde is not an obstacle course, it is a fluid. It flows around the car,
+piles up on the leading edge, and drags you down. Everything in the game comes
+out of that:
+
+- **Density slows you.** The more of them are pressed against the car, the more
+  drag they apply and the lower your top speed gets. A thick enough crowd is a
+  wall.
+- **Stopping kills you.** Below a certain speed you stop running them over and
+  they start pulling you out of the car. You have a handful of seconds.
+- **Two gears, and the choice matters.**
+  - `HIGH` — 125 km/h and long legs, but almost no torque off the line. It is
+    the gear you cover ground in, and the gear that gets you killed if a crowd
+    brings you to a halt.
+  - `LOW` — tops out early, but pulls hard from a standstill. It is the only
+    thing that will drag you out of a swarm that has already stopped you.
+- **The gore stays.** Bodies burst into chunks that live on the road as real
+  objects. Drive through a pile and you shove it aside, which leaves a cleared
+  channel through the mess — the trail you carved is visible behind you, and it
+  is the map of where you have already been.
+
+Zombies are slow, heavy and clog the car. Skeletons are quick and brittle: they
+die at lower speed but they reach you first and claw harder.
+
+## Controls
+
+| Key | |
+|---|---|
+| `W` / `↑` | throttle |
+| `S` / `↓` | brake, then reverse |
+| `A` `D` / `←` `→` | steer |
+| `Space` or `Shift` | change gear |
+| `P` | pause |
+| `M` | mute |
+| `Enter` | start, or restart after dying |
+| `R` | restart mid-run |
+
+## Running it
+
+The standalone build in `dist/` opens straight from disk. To run from source
+(ES modules need a server, not `file://`):
+
+```sh
+python3 -m http.server 8000    # then open http://localhost:8000
+```
+
+Rebuild the standalone file after changing anything under `js/`:
+
+```sh
+node tools/build-standalone.mjs
+```
+
+## Tests
+
+```sh
+npm test
+```
+
+The simulation is deliberately free of any DOM or canvas reference, so the
+whole game can be played headlessly. The suite drives it that way: it asserts
+the gearbox actually behaves the way the design claims (low gear escapes a
+full swarm, high gear bogs down in one), that a crowd is lethal but escapable
+rather than instantly fatal, that the car shoves gore aside instead of driving
+through it, and that a scripted bot can survive and rack up kills. It also
+holds the sim to a frame budget with a couple of thousand enemies alive.
+
+## Layout
+
+```
+js/
+  util.js          maths, seeded RNG
+  spatialhash.js   uniform grid behind every neighbour query
+  city.js          procedural city, collision
+  car.js           pure arcade physics and the gearbox
+  enemies.js       the horde: pooling, steering, separation, spawning
+  gore.js          pushable chunks
+  game.js          owns the world, steps it, emits events
+  sprites.js       every sprite drawn once into an offscreen canvas
+  render.js        camera, pseudo-3D city, decal-baked blood, HUD
+  input.js         keyboard
+  audio.js         procedural sound, no asset files
+  main.js          boot and the fixed-timestep loop
+tools/
+  build-standalone.mjs   bundles the modules into dist/
+test/
+  sim.test.mjs     headless simulation tests
+  bot.mjs          scripted driver used by the tests
+```
+
+`game.js` and everything it imports never touch the DOM. The renderer reads the
+simulation; the simulation never calls the renderer. That split is what makes
+the tests above possible.
+
+## Performance notes
+
+Roughly 2,600 enemies can be alive at once, so the hot paths are written for it:
+pooled objects with no per-frame allocation, a spatial hash rebuilt each frame,
+capped neighbour scans, and a cheap update tier for anything far off screen.
+Gore chunks park themselves once they stop moving and are skipped entirely until
+something disturbs them again. Blood is baked into half-resolution decal tiles
+so the trail survives long after the chunks that made it have been recycled.
+The simulation costs about 3ms per frame with 2,000 enemies on screen.

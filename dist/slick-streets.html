@@ -1,0 +1,2876 @@
+<title>Slick Streets</title>
+<style>
+:root {
+  color-scheme: dark;
+  --ink: #f2efe6;
+  --ground: #0a0b0e;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* The game is driven entirely with the keyboard - stop mobile gestures. */
+  overscroll-behavior: none;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#game {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  cursor: crosshair;
+  image-rendering: auto;
+}
+
+.notice {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+}
+
+/* Standalone build: the page is nothing but the game. */
+#hint {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  padding: 7px 14px;
+  font: 600 12px/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  letter-spacing: 0.08em;
+  color: rgba(242, 239, 230, 0.72);
+  background: rgba(8, 9, 12, 0.82);
+  border: 1px solid rgba(242, 239, 230, 0.16);
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+}
+#hint.gone { opacity: 0; }
+@media (prefers-reduced-motion: reduce) {
+  #hint { transition: none; }
+}
+</style>
+
+<canvas id="game" tabindex="0"></canvas>
+<div id="hint">CLICK THE STREET, THEN PRESS ENTER</div>
+
+<script>
+(function () {
+  'use strict';
+
+// ==================================================================
+// js/util.js
+// ==================================================================
+
+// Small math / RNG helpers shared by the simulation and the renderer.
+
+const TAU = Math.PI * 2;
+
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const sign = (v) => (v < 0 ? -1 : v > 0 ? 1 : 0);
+
+/** Deterministic 32-bit PRNG so a seed always builds the same city. */
+function mulberry32(a) {
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const rr = (rng, a, b) => a + (b - a) * rng();
+const ri = (rng, a, b) => Math.floor(a + (b - a + 1) * rng());
+const pick = (rng, arr) => arr[Math.floor(rng() * arr.length)];
+
+function dist2(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  return dx * dx + dy * dy;
+}
+
+function angleDiff(a, b) {
+  let d = (b - a) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+
+/** Move `v` toward `target` by at most `delta`. */
+function approach(v, target, delta) {
+  return v < target ? Math.min(v + delta, target) : Math.max(v - delta, target);
+}
+
+/** Frame-rate independent smoothing factor for exponential decay. */
+function damp(rate, dt) {
+  return 1 - Math.exp(-rate * dt);
+}
+
+// ==================================================================
+// js/spatialhash.js
+// ==================================================================
+
+// Uniform grid used for the thousands of enemies and gore chunks.
+// Buckets are recycled between frames so a full rebuild allocates nothing.
+
+const BIAS = 4096;
+const STRIDE = 8192;
+
+class SpatialHash {
+  constructor(cellSize) {
+    this.cellSize = cellSize;
+    this.inv = 1 / cellSize;
+    this.buckets = new Map();
+    this.used = [];
+  }
+
+  clear() {
+    for (let i = 0; i < this.used.length; i++) this.used[i].length = 0;
+    this.used.length = 0;
+  }
+
+  _key(cx, cy) {
+    return (cx + BIAS) * STRIDE + (cy + BIAS);
+  }
+
+  insert(x, y, item) {
+    const cx = Math.floor(x * this.inv);
+    const cy = Math.floor(y * this.inv);
+    const k = this._key(cx, cy);
+    let b = this.buckets.get(k);
+    if (b === undefined) {
+      b = [];
+      this.buckets.set(k, b);
+    }
+    if (b.length === 0) this.used.push(b);
+    b.push(item);
+  }
+
+  /**
+   * Collect every item stored in cells overlapping the circle (x, y, r).
+   * Results are a superset of the circle - callers do the exact test.
+   */
+  query(x, y, r, out) {
+    out.length = 0;
+    const x0 = Math.floor((x - r) * this.inv);
+    const x1 = Math.floor((x + r) * this.inv);
+    const y0 = Math.floor((y - r) * this.inv);
+    const y1 = Math.floor((y + r) * this.inv);
+    for (let cy = y0; cy <= y1; cy++) {
+      for (let cx = x0; cx <= x1; cx++) {
+        const b = this.buckets.get(this._key(cx, cy));
+        if (b === undefined) continue;
+        for (let i = 0; i < b.length; i++) out.push(b[i]);
+      }
+    }
+    return out;
+  }
+
+  /** Visit items in cells overlapping an axis-aligned rect. */
+  forEachInRect(x, y, w, h, fn) {
+    const x0 = Math.floor(x * this.inv);
+    const x1 = Math.floor((x + w) * this.inv);
+    const y0 = Math.floor(y * this.inv);
+    const y1 = Math.floor((y + h) * this.inv);
+    for (let cy = y0; cy <= y1; cy++) {
+      for (let cx = x0; cx <= x1; cx++) {
+        const b = this.buckets.get(this._key(cx, cy));
+        if (b === undefined) continue;
+        for (let i = 0; i < b.length; i++) fn(b[i]);
+      }
+    }
+  }
+}
+
+// ==================================================================
+// js/city.js
+// ==================================================================
+
+// Procedural city: a grid of blocks separated by roads. Every solid is an
+// axis-aligned box indexed by block cell, which keeps collision queries O(1).
+
+const CELL = 460;   // block pitch, road centre to road centre
+const ROAD = 150;   // drivable width between block interiors
+
+const WALL_COLORS = ['#4a4b56', '#565361', '#3f4450', '#5c5145', '#4d4a41', '#63606d'];
+const ROOF_COLORS = ['#6e6f7d', '#7b7787', '#5f6675', '#857462', '#6f6b5f', '#8a8697'];
+
+/** One solid obstacle. `top` is used by the renderer for fake extrusion. */
+function solid(x, y, w, h, kind, wall, roof, top) {
+  return { x, y, w, h, kind, wall, roof, top };
+}
+
+/**
+ * Split a rect into 1..n sub-rects, recursing on the longer axis.
+ * Produces believable rows of terraced buildings rather than a uniform grid.
+ */
+function subdivide(rng, x, y, w, h, depth, out) {
+  const minSide = 78;
+  if (depth <= 0 || (w < minSide * 2 && h < minSide * 2) || rng() < 0.18) {
+    out.push([x, y, w, h]);
+    return;
+  }
+  const splitX = w > h ? rng() < 0.85 : rng() < 0.15;
+  if (splitX && w >= minSide * 2) {
+    const t = rr(rng, 0.34, 0.66);
+    const a = Math.round(w * t);
+    subdivide(rng, x, y, a, h, depth - 1, out);
+    subdivide(rng, x + a, y, w - a, h, depth - 1, out);
+  } else if (!splitX && h >= minSide * 2) {
+    const t = rr(rng, 0.34, 0.66);
+    const a = Math.round(h * t);
+    subdivide(rng, x, y, w, a, depth - 1, out);
+    subdivide(rng, x, y + a, w, h - a, depth - 1, out);
+  } else {
+    out.push([x, y, w, h]);
+  }
+}
+
+function generateCity(seed = 1, cols = 40, rows = 40) {
+  const rng = mulberry32(seed >>> 0);
+  const city = {
+    seed,
+    cols,
+    rows,
+    cell: CELL,
+    road: ROAD,
+    width: cols * CELL,
+    height: rows * CELL,
+    blocks: [],
+    solids: [],
+    grid: new Map(),
+  };
+
+  const put = (cx, cy, s) => {
+    const k = cx * 8192 + cy;
+    let list = city.grid.get(k);
+    if (list === undefined) city.grid.set(k, (list = []));
+    list.push(s);
+    city.solids.push(s);
+  };
+
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const bx = cx * CELL + ROAD * 0.5;
+      const by = cy * CELL + ROAD * 0.5;
+      const bw = CELL - ROAD;
+      const bh = CELL - ROAD;
+
+      const roll = rng();
+      const type = roll < 0.09 ? 'park' : roll < 0.18 ? 'lot' : 'buildings';
+      const block = { cx, cy, x: bx, y: by, w: bw, h: bh, type, props: [] };
+      city.blocks.push(block);
+
+      if (type === 'buildings') {
+        const pad = 16;
+        const parts = [];
+        subdivide(rng, bx + pad, by + pad, bw - pad * 2, bh - pad * 2, 2, parts);
+        for (const [px, py, pw, ph] of parts) {
+          const gap = rr(rng, 3, 11);
+          const w = pw - gap * 2;
+          const h = ph - gap * 2;
+          if (w < 42 || h < 42) continue;
+          const idx = ri(rng, 0, WALL_COLORS.length - 1);
+          put(cx, cy, solid(px + gap, py + gap, w, h, 'building',
+            WALL_COLORS[idx], ROOF_COLORS[idx], rr(rng, 34, 96)));
+        }
+      } else if (type === 'park') {
+        const n = ri(rng, 4, 9);
+        for (let i = 0; i < n; i++) {
+          const r = rr(rng, 16, 26);
+          const x = rr(rng, bx + 30, bx + bw - 30 - r * 2);
+          const y = rr(rng, by + 30, by + bh - 30 - r * 2);
+          put(cx, cy, solid(x, y, r * 2, r * 2, 'tree', '#2f4a2c', '#3f6b39', rr(rng, 40, 62)));
+        }
+      } else {
+        const n = ri(rng, 2, 5);
+        for (let i = 0; i < n; i++) {
+          const horiz = rng() < 0.5;
+          const w = horiz ? 56 : 28;
+          const h = horiz ? 28 : 56;
+          const x = rr(rng, bx + 24, bx + bw - 24 - w);
+          const y = rr(rng, by + 24, by + bh - 24 - h);
+          put(cx, cy, solid(x, y, w, h, 'wreck',
+            pick(rng, ['#5b3a3a', '#3a4a5b', '#4a4a3a', '#52525c']), '#2a2a30', 16));
+        }
+      }
+    }
+  }
+
+  // Boundary walls so the player cannot leave the map.
+  const T = 220;
+  const W = city.width;
+  const H = city.height;
+  const edge = (x, y, w, h) => {
+    const s = solid(x, y, w, h, 'wall', '#33343d', '#43444f', 130);
+    city.solids.push(s);
+    city.edges = city.edges || [];
+    city.edges.push(s);
+  };
+  edge(-T, -T, W + T * 2, T);
+  edge(-T, H, W + T * 2, T);
+  edge(-T, 0, T, H);
+  edge(W, 0, T, H);
+
+  return city;
+}
+
+/** Solids whose block cell overlaps the circle, plus the boundary walls. */
+function solidsNear(city, x, y, r, out) {
+  out.length = 0;
+  const c = city.cell;
+  const x0 = Math.floor((x - r) / c);
+  const x1 = Math.floor((x + r) / c);
+  const y0 = Math.floor((y - r) / c);
+  const y1 = Math.floor((y + r) / c);
+  for (let cy = y0; cy <= y1; cy++) {
+    for (let cx = x0; cx <= x1; cx++) {
+      const list = city.grid.get(cx * 8192 + cy);
+      if (list === undefined) continue;
+      for (let i = 0; i < list.length; i++) out.push(list[i]);
+    }
+  }
+  if (city.edges && (x - r < 0 || y - r < 0 || x + r > city.width || y + r > city.height)) {
+    for (const e of city.edges) out.push(e);
+  }
+  return out;
+}
+
+const _scratch = [];
+
+/** True if a circle overlaps any solid - used to reject spawn points. */
+function isBlocked(city, x, y, r) {
+  const list = solidsNear(city, x, y, r, _scratch);
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    const nx = clamp(x, s.x, s.x + s.w);
+    const ny = clamp(y, s.y, s.y + s.h);
+    const dx = x - nx;
+    const dy = y - ny;
+    if (dx * dx + dy * dy < r * r) return true;
+  }
+  return false;
+}
+
+/**
+ * Push a circle out of every overlapping solid.
+ * Returns the accumulated push (nx, ny) and the deepest penetration.
+ */
+function resolveCircle(city, p, r, hit) {
+  const list = solidsNear(city, p.x, p.y, r, _scratch);
+  hit.nx = 0;
+  hit.ny = 0;
+  hit.depth = 0;
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    const nx = clamp(p.x, s.x, s.x + s.w);
+    const ny = clamp(p.y, s.y, s.y + s.h);
+    let dx = p.x - nx;
+    let dy = p.y - ny;
+    let d2 = dx * dx + dy * dy;
+    if (d2 >= r * r) continue;
+
+    if (d2 > 1e-6) {
+      const d = Math.sqrt(d2);
+      const push = r - d;
+      dx /= d;
+      dy /= d;
+      p.x += dx * push;
+      p.y += dy * push;
+      hit.nx += dx * push;
+      hit.ny += dy * push;
+      if (push > hit.depth) hit.depth = push;
+    } else {
+      // Centre is inside the box: eject along the shallowest axis.
+      const cx = s.x + s.w * 0.5;
+      const cy = s.y + s.h * 0.5;
+      const ox = s.w * 0.5 + r - Math.abs(p.x - cx);
+      const oy = s.h * 0.5 + r - Math.abs(p.y - cy);
+      if (ox < oy) {
+        const dir = p.x < cx ? -1 : 1;
+        p.x += ox * dir;
+        hit.nx += ox * dir;
+        if (ox > hit.depth) hit.depth = ox;
+      } else {
+        const dir = p.y < cy ? -1 : 1;
+        p.y += oy * dir;
+        hit.ny += oy * dir;
+        if (oy > hit.depth) hit.depth = oy;
+      }
+    }
+  }
+  return hit;
+}
+
+/** A road-centre point near (x, y): handy for spawning things on tarmac. */
+function nearestRoadPoint(city, x, y) {
+  const c = city.cell;
+  const cx = Math.round(x / c);
+  const cy = Math.round(y / c);
+  const onVertical = Math.abs(x - cx * c) < Math.abs(y - cy * c);
+  return onVertical ? { x: cx * c, y } : { x, y: cy * c };
+}
+
+// ==================================================================
+// js/car.js
+// ==================================================================
+
+// Pure arcade car physics. No canvas, no DOM - the headless tests drive this
+// directly to check that the gearbox behaves the way the design wants.
+
+const GEAR_LOW = 0;
+const GEAR_HIGH = 1;
+
+const CAR_LENGTH = 62;
+const CAR_WIDTH = 30;
+
+/**
+ * World units are pixels. These fix the one scale the HUD reports in, so the
+ * speedometer and the distance readout agree with each other:
+ * 62px of car ~ 3.3m, and a 660px/s top speed ~ 125km/h.
+ */
+const KMH_PER_PX = 0.19;
+const PX_PER_METRE = 18.95;
+
+/**
+ * LOW  - little top speed but full torque from a standstill, so it can drag
+ *        the car out of a swarm that has bogged it down.
+ * HIGH - long legs and a high top speed, but almost no torque down low: get
+ *        stopped by a crowd in high gear and you are not getting going again.
+ */
+const GEARS = [
+  { name: 'LOW',  maxSpeed: 235, force: 900, turn: 3.5, grip: 13, torqueFloor: 1.0,  torqueKnee: 1 },
+  { name: 'HIGH', maxSpeed: 660, force: 620, turn: 2.4, grip: 8.5, torqueFloor: 0.22, torqueKnee: 220 },
+];
+
+const REVERSE_SPEED = 130;
+/** Acceleration applied per unit of crowd pressure (pressure 1 = fully mobbed). */
+const CROWD_DRAG = 640;
+
+function createCar(x, y, ang = 0) {
+  return {
+    x, y, ang,
+    vx: 0, vy: 0,
+    gear: GEAR_HIGH,
+    speed: 0,        // signed, along the heading
+    rpm: 0,          // 0..1, for the engine note and the tacho
+    steer: 0,        // smoothed steering input
+    lastImpact: 0,   // speed lost to the most recent wall hit
+  };
+}
+
+function shiftGear(car, gear) {
+  if (car.gear === gear) return false;
+  car.gear = gear;
+  return true;
+}
+
+function toggleGear(car) {
+  car.gear = car.gear === GEAR_LOW ? GEAR_HIGH : GEAR_LOW;
+  return car.gear;
+}
+
+/** Fraction of peak engine force available at the current speed. */
+function torqueAt(gear, speed) {
+  const g = GEARS[gear];
+  return clamp(g.torqueFloor + (1 - g.torqueFloor) * (speed / g.torqueKnee), 0, 1);
+}
+
+/**
+ * Advance the car one step.
+ *   input: { throttle: -1..1, steer: -1..1 }
+ *   env:   { crowd: 0..1+ swarm pressure, gore: 0..1 gore drag }
+ */
+function updateCar(car, input, dt, env) {
+  const g = GEARS[car.gear];
+  const crowd = env && env.crowd ? env.crowd : 0;
+  const gore = env && env.gore ? env.gore : 0;
+
+  const cos = Math.cos(car.ang);
+  const sin = Math.sin(car.ang);
+
+  // Split velocity into forward / lateral so we can apply grip to the slide.
+  let fwd = car.vx * cos + car.vy * sin;
+  let lat = -car.vx * sin + car.vy * cos;
+
+  const throttle = clamp(input.throttle || 0, -1, 1);
+
+  let accel = 0;
+  if (throttle > 0) {
+    const torque = torqueAt(car.gear, Math.max(0, fwd));
+    const headroom = 1 - Math.pow(clamp(fwd / g.maxSpeed, 0, 1), 1.6);
+    accel = g.force * torque * headroom * throttle;
+  } else if (throttle < 0) {
+    // Brake hard while rolling forward, then creep backwards.
+    accel = fwd > 12 ? -1500 * -throttle : -520 * -throttle;
+    if (fwd < -REVERSE_SPEED) accel = 0;
+  }
+
+  // Rolling resistance plus whatever is currently clogging the wheels.
+  const resist = 0.55 * fwd + sign(fwd) * (crowd * CROWD_DRAG + gore * 260);
+  fwd += (accel - resist) * dt;
+
+  // Crowd pressure also caps outright top speed, so a thick mob is a wall.
+  const cap = g.maxSpeed * (1 - 0.55 * clamp(crowd, 0, 1));
+  if (fwd > cap) fwd += (cap - fwd) * Math.min(1, dt * 4);
+  if (fwd < -REVERSE_SPEED) fwd = -REVERSE_SPEED;
+  if (Math.abs(fwd) < 1.5 && throttle === 0) fwd = 0;
+
+  // Tyres scrub off sideways velocity; less grip when the crowd is shoving.
+  lat -= lat * Math.min(1, g.grip * dt * (1 - 0.35 * clamp(crowd, 0, 1)));
+
+  // Steering authority falls away at very low and very high speed.
+  const target = clamp(input.steer || 0, -1, 1);
+  car.steer += (target - car.steer) * Math.min(1, dt * 12);
+  const gripSpeed = clamp(Math.abs(fwd) / 90, 0, 1);
+  const fast = 1 - 0.45 * clamp(Math.abs(fwd) / g.maxSpeed, 0, 1);
+  car.ang += car.steer * g.turn * gripSpeed * fast * sign(fwd || 1) * dt;
+  if (car.ang > Math.PI) car.ang -= TAU;
+  if (car.ang < -Math.PI) car.ang += TAU;
+
+  const c2 = Math.cos(car.ang);
+  const s2 = Math.sin(car.ang);
+  car.vx = fwd * c2 - lat * s2;
+  car.vy = fwd * s2 + lat * c2;
+  car.x += car.vx * dt;
+  car.y += car.vy * dt;
+  car.speed = fwd;
+
+  const targetRpm = clamp(Math.abs(fwd) / g.maxSpeed, 0, 1) * 0.8 + (throttle > 0 ? 0.2 : 0.05);
+  car.rpm += (targetRpm - car.rpm) * Math.min(1, dt * 6);
+  return car;
+}
+
+/**
+ * Bleed speed when the car body hits something solid.
+ * A grazing scrape only cancels the velocity going into the wall, so you can
+ * slide along a building; a square-on hit scrubs most of your momentum.
+ * Returns the speed lost, which the caller turns into damage and shake.
+ */
+function applyImpact(car, nx, ny) {
+  const len = Math.hypot(nx, ny);
+  if (len < 1e-5) return 0;
+  nx /= len;
+  ny /= len;
+  const into = car.vx * nx + car.vy * ny; // negative when driving into the wall
+  if (into >= 0) return 0;
+  const lost = -into;
+
+  // Cancel the component going into the wall, with a little bounce back.
+  const restitution = 0.18;
+  car.vx -= nx * into * (1 + restitution);
+  car.vy -= ny * into * (1 + restitution);
+
+  // Scrub tangential speed in proportion to how hard the hit was.
+  const scrub = clamp(lost / 320, 0, 1) * 0.55;
+  car.vx *= 1 - scrub;
+  car.vy *= 1 - scrub;
+
+  car.speed = car.vx * Math.cos(car.ang) + car.vy * Math.sin(car.ang);
+  car.lastImpact = lost;
+  return lost;
+}
+
+/** Circle-vs-oriented-box test used for running things over. */
+function overlapsCar(car, x, y, r) {
+  const dx = x - car.x;
+  const dy = y - car.y;
+  const cos = Math.cos(car.ang);
+  const sin = Math.sin(car.ang);
+  const lx = dx * cos + dy * sin;
+  const ly = -dx * sin + dy * cos;
+  return Math.abs(lx) < CAR_LENGTH * 0.5 + r && Math.abs(ly) < CAR_WIDTH * 0.5 + r;
+}
+
+/** World-space point of the two collision circles approximating the body. */
+function bodyCircle(car, which, out) {
+  const off = which === 0 ? CAR_LENGTH * 0.26 : -CAR_LENGTH * 0.26;
+  out.x = car.x + Math.cos(car.ang) * off;
+  out.y = car.y + Math.sin(car.ang) * off;
+  return out;
+}
+const BODY_RADIUS = CAR_WIDTH * 0.55;
+
+// ==================================================================
+// js/enemies.js
+// ==================================================================
+
+// The horde. Thousands of agents, so everything here is written for the
+// common case: pooled objects, a rebuilt spatial hash, capped neighbour scans
+// and a cheap update tier for anything far off screen.
+
+
+
+const ZOMBIE = 0;
+const SKELETON = 1;
+
+/**
+ * Zombies are heavy and slow: they clog the car and are the source of the
+ * thick gore. Skeletons are quick and brittle - they die at lower speed but
+ * they get to you first and claw harder.
+ */
+const KINDS = [
+  { name: 'zombie',   radius: 9,   speed: [42, 74],  killSpeed: 88, mass: 1.0, damage: 3.2, drag: 1.0, gore: 6 },
+  { name: 'skeleton', radius: 7.5, speed: [86, 128], killSpeed: 52, mass: 0.55, damage: 5.0, drag: 0.6, gore: 3 },
+];
+
+const ACTIVE_RADIUS = 1750;   // full-rate AI inside this radius of the car
+const DESPAWN_RADIUS = 2900;
+const SPAWN_MIN = 820;
+const SPAWN_MAX = 1360;
+const MAX_ENEMIES = 2600;
+const SEPARATION_R = 24;
+const MAX_NEIGHBOURS = 10;
+
+class Swarm {
+  constructor(city, seed = 1) {
+    this.city = city;
+    this.rng = mulberry32((seed * 2654435761) >>> 0);
+    this.hash = new SpatialHash(32);
+    this.pool = new Array(MAX_ENEMIES);
+    this.free = [];
+    this.active = [];
+    for (let i = 0; i < MAX_ENEMIES; i++) {
+      this.pool[i] = {
+        i, alive: false, x: 0, y: 0, vx: 0, vy: 0, ang: 0,
+        r: 9, kind: ZOMBIE, spd: 50, phase: 0, wob: 0, stun: 0,
+      };
+      this.free.push(this.pool[i]);
+    }
+    this._q = [];
+    this._hit = { nx: 0, ny: 0, depth: 0 };
+    this._tick = 0;
+    this.hordeTimer = 6;
+  }
+
+  get count() { return this.active.length; }
+
+  reset() {
+    for (const e of this.active) e.alive = false;
+    this.active.length = 0;
+    this.free.length = 0;
+    for (let i = 0; i < this.pool.length; i++) this.free.push(this.pool[i]);
+    this.hordeTimer = 6;
+  }
+
+  spawn(x, y, kind) {
+    const e = this.free.pop();
+    if (e === undefined) return null;
+    const k = KINDS[kind];
+    e.alive = true;
+    e.x = x;
+    e.y = y;
+    e.vx = 0;
+    e.vy = 0;
+    e.kind = kind;
+    e.r = k.radius;
+    e.spd = rr(this.rng, k.speed[0], k.speed[1]);
+    e.ang = rr(this.rng, 0, TAU);
+    e.phase = rr(this.rng, 0, TAU);
+    e.wob = rr(this.rng, 0.6, 1.6);
+    e.stun = 0;
+    this.active.push(e);
+    return e;
+  }
+
+  kill(e) {
+    e.alive = false;
+    const idx = this.active.indexOf(e);
+    if (idx >= 0) {
+      this.active[idx] = this.active[this.active.length - 1];
+      this.active.pop();
+    }
+    this.free.push(e);
+  }
+
+  /**
+   * Find a spawn point on open ground in a ring around the car. Spawns are
+   * biased toward `heading` so the street you are driving down is always
+   * filling up ahead of you instead of emptying out behind.
+   */
+  _spawnPoint(tx, ty, out, heading) {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const a = heading !== undefined && this.rng() < 0.72
+        ? heading + rr(this.rng, -0.85, 0.85)
+        : this.rng() * TAU;
+      const d = rr(this.rng, SPAWN_MIN, SPAWN_MAX);
+      const x = tx + Math.cos(a) * d;
+      const y = ty + Math.sin(a) * d;
+      if (x < 40 || y < 40 || x > this.city.width - 40 || y > this.city.height - 40) continue;
+      if (isBlocked(this.city, x, y, 12)) continue;
+      out.x = x;
+      out.y = y;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * `difficulty` is 0..1 and drives both how many of them there are and how
+   * many of those are skeletons.
+   */
+  update(dt, target, difficulty) {
+    const city = this.city;
+    const rng = this.rng;
+    this._tick++;
+
+    // ---- population -------------------------------------------------
+    const want = Math.min(MAX_ENEMIES, Math.round(430 + 2100 * difficulty));
+    const skelChance = 0.06 + 0.42 * difficulty;
+    const p = { x: 0, y: 0 };
+    const moving = Math.hypot(target.vx, target.vy) > 70;
+    const heading = moving ? Math.atan2(target.vy, target.vx) : undefined;
+    let budget = 40;
+    while (this.active.length < want && budget-- > 0) {
+      if (!this._spawnPoint(target.x, target.y, p, heading)) break;
+      this.spawn(p.x, p.y, rng() < skelChance ? SKELETON : ZOMBIE);
+    }
+
+    // Occasional tight cluster dumped into the street: a proper wall of them.
+    this.hordeTimer -= dt;
+    if (this.hordeTimer <= 0) {
+      this.hordeTimer = rr(rng, 9, 17) * (1 - 0.4 * difficulty);
+      if (this._spawnPoint(target.x, target.y, p, heading)) {
+        const n = Math.round(rr(rng, 30, 70) * (0.5 + difficulty));
+        for (let i = 0; i < n; i++) {
+          const a = rng() * TAU;
+          const d = Math.sqrt(rng()) * rr(rng, 60, 190);
+          const x = p.x + Math.cos(a) * d;
+          const y = p.y + Math.sin(a) * d;
+          if (isBlocked(city, x, y, 10)) continue;
+          this.spawn(x, y, rng() < skelChance ? SKELETON : ZOMBIE);
+        }
+      }
+    }
+
+    // ---- rebuild the hash -------------------------------------------
+    this.hash.clear();
+    const act = this.active;
+    for (let i = 0; i < act.length; i++) this.hash.insert(act[i].x, act[i].y, act[i]);
+
+    // ---- steering ----------------------------------------------------
+    const q = this._q;
+    const activeR2 = ACTIVE_RADIUS * ACTIVE_RADIUS;
+    const despawn2 = DESPAWN_RADIUS * DESPAWN_RADIUS;
+    const slowPhase = this._tick % 6;
+
+    for (let i = act.length - 1; i >= 0; i--) {
+      const e = act[i];
+      const dx = target.x - e.x;
+      const dy = target.y - e.y;
+      const d2 = dx * dx + dy * dy;
+
+      if (d2 > despawn2) {
+        if (act.length > want * 0.85) this.kill(e);
+        continue;
+      }
+
+      let step = dt;
+      if (d2 > activeR2) {
+        // Far away: think once every six frames with a six-times-longer step.
+        if (e.i % 6 !== slowPhase) continue;
+        step = dt * 6;
+      }
+
+      const d = Math.sqrt(d2) || 1;
+      const k = KINDS[e.kind];
+
+      let ax = dx / d;
+      let ay = dy / d;
+
+      // Shambling wobble so a mass of them does not move as one rigid blob.
+      e.phase += step * (2.4 + e.wob);
+      const wob = Math.sin(e.phase) * 0.28 * e.wob;
+      const wx = ax * Math.cos(wob) - ay * Math.sin(wob);
+      const wy = ax * Math.sin(wob) + ay * Math.cos(wob);
+      ax = wx;
+      ay = wy;
+
+      // Separation - the reason a swarm has a surface instead of a singularity.
+      if (d2 < activeR2) {
+        this.hash.query(e.x, e.y, SEPARATION_R, q);
+        let sx = 0;
+        let sy = 0;
+        let n = 0;
+        for (let j = 0; j < q.length && n < MAX_NEIGHBOURS; j++) {
+          const o = q[j];
+          if (o === e) continue;
+          const ox = e.x - o.x;
+          const oy = e.y - o.y;
+          const od2 = ox * ox + oy * oy;
+          const min = e.r + o.r;
+          if (od2 > min * min || od2 < 1e-6) continue;
+          const od = Math.sqrt(od2);
+          const w = (min - od) / min;
+          sx += (ox / od) * w;
+          sy += (oy / od) * w;
+          n++;
+        }
+        if (n > 0) {
+          ax += sx * 2.6;
+          ay += sy * 2.6;
+        }
+      }
+
+      const al = Math.hypot(ax, ay) || 1;
+      let spd = e.spd;
+      if (e.stun > 0) {
+        e.stun -= step;
+        spd *= 0.25;
+      }
+
+      // Knockback velocity decays; steering blends in on top of it.
+      e.vx += ((ax / al) * spd - e.vx) * Math.min(1, step * 6);
+      e.vy += ((ay / al) * spd - e.vy) * Math.min(1, step * 6);
+      e.x += e.vx * step;
+      e.y += e.vy * step;
+      e.ang = Math.atan2(e.vy, e.vx);
+
+      resolveCircle(city, e, e.r, this._hit);
+    }
+  }
+
+  /** Enemies whose cells overlap the circle. */
+  query(x, y, r, out) {
+    return this.hash.query(x, y, r, out);
+  }
+
+  /** Shove nearby enemies away from a point - used when the car ploughs in. */
+  knockback(x, y, radius, power) {
+    const q = this.hash.query(x, y, radius, this._q);
+    for (let i = 0; i < q.length; i++) {
+      const e = q[i];
+      const dx = e.x - x;
+      const dy = e.y - y;
+      const d = Math.hypot(dx, dy) || 1;
+      if (d > radius) continue;
+      const f = (1 - d / radius) * power;
+      e.vx += (dx / d) * f;
+      e.vy += (dy / d) * f;
+      e.stun = Math.max(e.stun, 0.25);
+    }
+  }
+}
+
+// ==================================================================
+// js/gore.js
+// ==================================================================
+
+// Gore chunks are real, movable little bodies rather than decals, because the
+// whole point is that you can plough through a pile and shove it aside.
+//
+// Cost is kept down by parking settled chunks: once a chunk stops moving it
+// is skipped entirely until the car (or another chunk) disturbs it again.
+
+
+
+const MAX_CHUNKS = 3200;
+
+const MEAT = 0;
+const BONE = 1;
+
+class GoreField {
+  constructor(seed = 1) {
+    this.rng = mulberry32((seed * 40503) >>> 0);
+    this.hash = new SpatialHash(28);
+    this.chunks = new Array(MAX_CHUNKS);
+    for (let i = 0; i < MAX_CHUNKS; i++) {
+      this.chunks[i] = {
+        live: false, x: 0, y: 0, vx: 0, vy: 0, r: 5, rot: 0, spin: 0,
+        type: MEAT, tone: 0, shape: 0, moving: false, age: 0,
+      };
+    }
+    this.head = 0;      // ring-buffer cursor: oldest gore is recycled first
+    this.live = 0;
+    /** Splats waiting to be baked into the renderer's decal layer. */
+    this.splats = [];
+    this._q = [];
+  }
+
+  reset() {
+    for (const c of this.chunks) c.live = false;
+    this.head = 0;
+    this.live = 0;
+    this.splats.length = 0;
+  }
+
+  _next() {
+    const c = this.chunks[this.head];
+    this.head = (this.head + 1) % MAX_CHUNKS;
+    if (!c.live) this.live++;
+    c.live = true;
+    return c;
+  }
+
+  /**
+   * Burst one enemy into chunks, thrown along the direction it was hit from.
+   * `power` is roughly the car's speed - faster hits spray further.
+   */
+  burst(x, y, dirx, diry, power, kind, amount) {
+    const rng = this.rng;
+    const spread = clamp(power / 260, 0.25, 1.6);
+    for (let i = 0; i < amount; i++) {
+      const c = this._next();
+      const a = Math.atan2(diry, dirx) + rr(rng, -0.9, 0.9);
+      const sp = rr(rng, 40, 240) * spread;
+      c.x = x + rr(rng, -6, 6);
+      c.y = y + rr(rng, -6, 6);
+      c.vx = Math.cos(a) * sp;
+      c.vy = Math.sin(a) * sp;
+      c.r = kind === BONE ? rr(rng, 3, 6.5) : rr(rng, 4.5, 11);
+      c.rot = rr(rng, 0, TAU);
+      c.spin = rr(rng, -6, 6);
+      c.type = kind;
+      c.tone = rng();
+      c.shape = Math.floor(rng() * 4);
+      c.moving = true;
+      c.age = 0;
+    }
+    this.splats.push({
+      x, y,
+      r: (kind === BONE ? 22 : 34) + power * 0.06,
+      tone: this.rng(),
+      kind,
+      dirx, diry,
+      power,
+    });
+  }
+
+  /** Rebuild the hash and step every chunk that is still in motion. */
+  update(dt) {
+    this.hash.clear();
+    const arr = this.chunks;
+    for (let i = 0; i < arr.length; i++) {
+      const c = arr[i];
+      if (!c.live) continue;
+      this.hash.insert(c.x, c.y, c);
+      if (!c.moving) continue;
+
+      c.age += dt;
+      const fr = Math.exp(-7.5 * dt);
+      c.vx *= fr;
+      c.vy *= fr;
+      c.rot += c.spin * dt;
+      c.spin *= fr;
+      c.x += c.vx * dt;
+      c.y += c.vy * dt;
+
+      if (c.vx * c.vx + c.vy * c.vy < 36) {
+        c.vx = 0;
+        c.vy = 0;
+        c.spin = 0;
+        c.moving = false;
+      }
+    }
+
+    // Moving chunks shoulder settled ones aside, so a shoved pile spreads
+    // outwards instead of everything piling onto one point.
+    const q = this._q;
+    for (let i = 0; i < arr.length; i++) {
+      const c = arr[i];
+      if (!c.live || !c.moving) continue;
+      this.hash.query(c.x, c.y, c.r * 2, q);
+      let n = 0;
+      for (let j = 0; j < q.length && n < 6; j++) {
+        const o = q[j];
+        if (o === c || !o.live) continue;
+        const dx = o.x - c.x;
+        const dy = o.y - c.y;
+        const d2 = dx * dx + dy * dy;
+        const min = (c.r + o.r) * 0.8;
+        if (d2 > min * min || d2 < 1e-6) continue;
+        const d = Math.sqrt(d2);
+        const push = (min - d) / min;
+        o.x += (dx / d) * push * 1.4;
+        o.y += (dy / d) * push * 1.4;
+        o.vx += (dx / d) * push * 26;
+        o.vy += (dy / d) * push * 26;
+        o.moving = true;
+        n++;
+      }
+    }
+  }
+
+  /**
+   * Shove chunks out of the car's footprint and report how clogged the car is.
+   * Returns 0..1 gore drag.
+   */
+  plough(car) {
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+    const speed = Math.abs(car.speed);
+    const reach = CAR_LENGTH * 0.7;
+    const q = this.hash.query(car.x, car.y, reach + 14, this._q);
+    let touching = 0;
+
+    for (let i = 0; i < q.length; i++) {
+      const c = q[i];
+      if (!c.live) continue;
+      const dx = c.x - car.x;
+      const dy = c.y - car.y;
+      const lx = dx * cos + dy * sin;
+      const ly = -dx * sin + dy * cos;
+      const hx = CAR_LENGTH * 0.5 + c.r;
+      const hy = CAR_WIDTH * 0.5 + c.r;
+      if (Math.abs(lx) > hx || Math.abs(ly) > hy) continue;
+
+      touching++;
+      // Eject sideways: that is what leaves clean wheel tracks through a pile.
+      const side = ly >= 0 ? 1 : -1;
+      const out = hy - Math.abs(ly) + 0.5;
+      const px = -sin * side;
+      const py = cos * side;
+      c.x += px * out;
+      c.y += py * out;
+      const force = 60 + speed * 0.55;
+      c.vx += px * force + cos * car.speed * 0.06;
+      c.vy += py * force + sin * car.speed * 0.06;
+      c.spin += (this.rng() - 0.5) * 12;
+      c.moving = true;
+    }
+    return clamp(touching / 26, 0, 1);
+  }
+}
+
+// ==================================================================
+// js/game.js
+// ==================================================================
+
+// Simulation owner. Holds the world and steps it; produces `events` that the
+// presentation layer turns into sound and screen shake. No DOM in here.
+
+
+
+
+
+const MAX_HEALTH = 100;
+const CROWD_RADIUS = 82;
+const CROWD_NORM = 15;      // enemies-worth of pressure that counts as "mobbed"
+const GRAB_SOFT_CAP = 22;   // asymptotic ceiling on damage per second
+const REGEN_DELAY = 4.0;
+const REGEN_RATE = 3.0;
+const COMBO_WINDOW = 1.4;
+const RAMP_SECONDS = 260;   // time to reach maximum horde density
+
+const MAX_PARTICLES = 900;
+
+class Game {
+  constructor(seed = Date.now()) {
+    this.seed = seed >>> 0;
+    this.particles = new Array(MAX_PARTICLES);
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      this.particles[i] = { live: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, size: 2, kind: 0, tone: 0 };
+    }
+    this.pHead = 0;
+    this.events = [];
+    this._q = [];
+    this._tmp = { x: 0, y: 0 };
+    this._hit = { nx: 0, ny: 0, depth: 0 };
+    this.bestScore = 0; // set by the host from local storage; survives resets
+    this.reset(this.seed);
+  }
+
+  reset(seed = this.seed) {
+    this.seed = seed >>> 0;
+    this.rng = mulberry32(this.seed ^ 0x9e3779b9);
+    this.city = generateCity(this.seed, 40, 40);
+    this.swarm = new Swarm(this.city, this.seed);
+    this.gore = new GoreField(this.seed);
+
+    // Start on an intersection near the middle of the map.
+    const c = this.city.cell;
+    const gx = Math.floor(this.city.cols / 2) * c;
+    const gy = Math.floor(this.city.rows / 2) * c;
+    this.car = createCar(gx, gy, -Math.PI / 2);
+    this.car.gear = GEAR_HIGH;
+
+    this.state = 'title';
+    this.time = 0;
+    this.health = MAX_HEALTH;
+    this.kills = 0;
+    this.zombieKills = 0;
+    this.skeletonKills = 0;
+    this.distance = 0;
+    this.score = 0;
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.bestCombo = 0;
+    this.crowd = 0;
+    this.goreDrag = 0;
+    this.grabbers = 0;
+    this.hurtTimer = 0;
+    this.shake = 0;
+    this.deathCause = '';
+    for (const p of this.particles) p.live = false;
+    this.events.length = 0;
+    this._seedAttractHorde();
+  }
+
+  /**
+   * Fill the streets around the parked car for the title screen. Ordinary
+   * spawning happens out beyond the edge of the view, which would leave the
+   * menu looking like an empty city for the first few seconds.
+   */
+  _seedAttractHorde() {
+    const { car, rng } = this;
+    for (let i = 0; i < 320; i++) {
+      const a = rng() * TAU;
+      const d = 220 + Math.sqrt(rng()) * 900;
+      const x = car.x + Math.cos(a) * d;
+      const y = car.y + Math.sin(a) * d;
+      if (isBlocked(this.city, x, y, 10)) continue;
+      this.swarm.spawn(x, y, rng() < 0.2 ? SKELETON : ZOMBIE);
+    }
+  }
+
+  start() {
+    if (this.state === 'playing') return;
+    if (this.state === 'dead') this.reset((Math.random() * 0xffffffff) >>> 0);
+    // The attract-mode horde has been converging on a parked car; clear it so
+    // every run starts with room to get moving rather than already buried.
+    this.swarm.reset();
+    this.gore.reset();
+    this.state = 'playing';
+    this.events.push({ type: 'start' });
+  }
+
+  get difficulty() {
+    return clamp(this.time / RAMP_SECONDS, 0, 1);
+  }
+
+  emitParticle(x, y, vx, vy, life, size, kind, tone) {
+    const p = this.particles[this.pHead];
+    this.pHead = (this.pHead + 1) % MAX_PARTICLES;
+    p.live = true;
+    p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+    p.life = life; p.max = life; p.size = size; p.kind = kind; p.tone = tone;
+  }
+
+  shiftTo(gear) {
+    if (this.state !== 'playing' || this.car.gear === gear) return;
+    this.car.gear = gear;
+    this.events.push({ type: 'shift', gear });
+  }
+
+  toggleGear() {
+    if (this.state !== 'playing') return;
+    this.events.push({ type: 'shift', gear: toggleGear(this.car) });
+  }
+
+  update(dt, input) {
+    this.events.length = 0;
+    if (this.state !== 'playing') {
+      // Keep the horde milling around behind the menus so it never looks static.
+      this.swarm.update(dt, this.car, 0.08);
+      this.gore.update(dt);
+      this.shake *= Math.exp(-4 * dt);
+      return;
+    }
+
+    this.time += dt;
+    const car = this.car;
+    const px = car.x;
+    const py = car.y;
+
+    this.swarm.update(dt, car, this.difficulty);
+
+    // ---- run them over ------------------------------------------------
+    const speed = Math.abs(car.speed);
+    const q = this.swarm.query(car.x, car.y, CROWD_RADIUS, this._q);
+    let crowd = 0;
+    let grabDamage = 0;
+    let grabbers = 0;
+    let killsThisFrame = 0;
+    let massKilled = 0;
+
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+
+    for (let i = 0; i < q.length; i++) {
+      const e = q[i];
+      if (!e.alive) continue;
+      const dx = e.x - car.x;
+      const dy = e.y - car.y;
+      const d = Math.hypot(dx, dy);
+      const k = KINDS[e.kind];
+
+      if (d < CROWD_RADIUS) {
+        crowd += (1 - d / CROWD_RADIUS) * k.drag;
+      }
+
+      if (!overlapsCar(car, e.x, e.y, e.r)) continue;
+
+      if (speed >= k.killSpeed) {
+        // Splat. Throw the gore forward along the car's heading.
+        const dirx = car.vx / (speed || 1);
+        const diry = car.vy / (speed || 1);
+        this.gore.burst(e.x, e.y, dirx, diry, speed, e.kind === ZOMBIE ? MEAT : BONE, k.gore);
+        for (let s = 0; s < 4; s++) {
+          this.emitParticle(
+            e.x, e.y,
+            dirx * rr(this.rng, 40, 320) + rr(this.rng, -90, 90),
+            diry * rr(this.rng, 40, 320) + rr(this.rng, -90, 90),
+            rr(this.rng, 0.25, 0.6), rr(this.rng, 1.5, 4),
+            e.kind === ZOMBIE ? 0 : 1, this.rng(),
+          );
+        }
+        this.swarm.kill(e);
+        killsThisFrame++;
+        massKilled += k.mass;
+        this.kills++;
+        if (e.kind === ZOMBIE) this.zombieKills++; else this.skeletonKills++;
+        this.combo++;
+        this.comboTimer = COMBO_WINDOW;
+        if (this.combo > this.bestCombo) this.bestCombo = this.combo;
+        this.score += Math.round(10 * (1 + Math.min(this.combo, 40) * 0.05));
+        this.shake = Math.min(this.shake + 0.5 + speed * 0.004, 9);
+        this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed });
+      } else {
+        // Too slow to kill it - now it is clawing at the doors.
+        const bite = clamp(1 - speed / k.killSpeed, 0, 1);
+        grabDamage += k.damage * bite;
+        grabbers++;
+      }
+    }
+
+    if (killsThisFrame > 0) {
+      // Bodies cost you momentum: ploughing a wall of them bleeds speed.
+      const drop = clamp(1 - 0.006 * massKilled, 0.7, 1);
+      car.vx *= drop;
+      car.vy *= drop;
+      car.speed *= drop;
+      this.swarm.knockback(car.x, car.y, 70, 90 + speed * 0.3);
+    }
+
+    this.crowd = clamp(crowd / CROWD_NORM, 0, 1.25);
+    this.grabbers = grabbers;
+
+    // ---- drive ---------------------------------------------------------
+    updateCar(car, input, dt, { crowd: this.crowd, gore: this.goreDrag });
+
+    // ---- walls ----------------------------------------------------------
+    let hitDepth = 0;
+    let hnx = 0;
+    let hny = 0;
+    for (let i = 0; i < 2; i++) {
+      const t = bodyCircle(car, i, this._tmp);
+      const bx = t.x;
+      const by = t.y;
+      resolveCircle(this.city, t, BODY_RADIUS, this._hit);
+      car.x += t.x - bx;
+      car.y += t.y - by;
+      if (this._hit.depth > 0) {
+        hnx += this._hit.nx;
+        hny += this._hit.ny;
+        if (this._hit.depth > hitDepth) hitDepth = this._hit.depth;
+        // Glancing blows slew the car around rather than stopping it dead.
+        const armx = i === 0 ? cos : -cos;
+        const army = i === 0 ? sin : -sin;
+        car.ang += (armx * this._hit.ny - army * this._hit.nx) * 0.02;
+      }
+    }
+    if (hitDepth > 0.05) {
+      const lost = applyImpact(car, hnx, hny);
+      // Hitting a building mostly punishes you by stopping you dead in the
+      // middle of the horde - the dent itself is the smaller part of it.
+      if (lost > 120) {
+        this.health -= clamp((lost - 120) * 0.035, 0, 18);
+        this.hurtTimer = 0;
+        this.shake = Math.min(this.shake + lost * 0.02, 14);
+        this.events.push({ type: 'crash', force: lost, x: car.x, y: car.y });
+        for (let s = 0; s < 8; s++) {
+          this.emitParticle(
+            car.x + cos * 26, car.y + sin * 26,
+            rr(this.rng, -140, 140), rr(this.rng, -140, 140),
+            rr(this.rng, 0.2, 0.5), rr(this.rng, 1, 2.5), 2, this.rng(),
+          );
+        }
+      }
+    }
+
+    // ---- gore -----------------------------------------------------------
+    this.gore.update(dt);
+    this.goreDrag = this.gore.plough(car);
+
+    // ---- damage and healing ---------------------------------------------
+    if (grabDamage > 0) {
+      // Soft cap: a dozen of them is lethal, but not instantly. You get a few
+      // seconds to drop into low gear and grind your way out.
+      const dps = grabDamage / (1 + grabDamage / GRAB_SOFT_CAP);
+      this.health -= dps * dt;
+      this.hurtTimer = 0;
+      this.shake = Math.min(this.shake + dps * dt * 0.6, 8);
+      if (this.health > 0) this.events.push({ type: 'hurt', amount: dps });
+    } else {
+      this.hurtTimer += dt;
+      if (this.hurtTimer > REGEN_DELAY) {
+        this.health = Math.min(MAX_HEALTH, this.health + REGEN_RATE * dt);
+      }
+    }
+
+    // ---- bookkeeping ------------------------------------------------------
+    if (this.comboTimer > 0) {
+      this.comboTimer -= dt;
+      if (this.comboTimer <= 0) this.combo = 0;
+    }
+    this.distance += Math.hypot(car.x - px, car.y - py);
+    this.shake *= Math.exp(-5 * dt);
+
+    this.updateParticles(dt);
+
+    if (this.health <= 0) {
+      this.health = 0;
+      this.state = 'dead';
+      this.deathCause = grabbers > 0 ? 'DRAGGED FROM THE WRECK' : 'WRAPPED AROUND A WALL';
+      this.shake = 16;
+      this.events.push({ type: 'death' });
+    }
+  }
+
+  updateParticles(dt) {
+    const arr = this.particles;
+    for (let i = 0; i < arr.length; i++) {
+      const p = arr[i];
+      if (!p.live) continue;
+      p.life -= dt;
+      if (p.life <= 0) { p.live = false; continue; }
+      const fr = Math.exp(-4.5 * dt);
+      p.vx *= fr;
+      p.vy *= fr;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    }
+  }
+
+  get totalScore() {
+    const metres = this.distance / PX_PER_METRE;
+    return Math.round(this.score + metres * 0.75 + this.time * 2);
+  }
+}
+
+// ==================================================================
+// js/sprites.js
+// ==================================================================
+
+// Every sprite is drawn once into an offscreen canvas at boot, then blitted
+// thousands of times per frame. Sprites face +x, matching an angle of 0.
+
+
+const SS = 2; // supersample factor, for crisp edges on hi-dpi screens
+
+function makeCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * SS);
+  c.height = Math.ceil(h * SS);
+  const ctx = c.getContext('2d');
+  ctx.scale(SS, SS);
+  c.w = w;
+  c.h = h;
+  return { canvas: c, ctx };
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawCar(ctx, w, h) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const L = CAR_LENGTH;
+  const W = CAR_WIDTH;
+  const x = cx - L / 2;
+  const y = cy - W / 2;
+
+  // Wheels poking out from under the body.
+  ctx.fillStyle = '#14151a';
+  for (const [wx, wy] of [[0.30, -0.5], [0.30, 0.5], [-0.30, -0.5], [-0.30, 0.5]]) {
+    roundRect(ctx, cx + wx * L - 7, cy + wy * W - 4.5, 14, 9, 3);
+    ctx.fill();
+  }
+
+  // Body.
+  const body = ctx.createLinearGradient(0, y, 0, y + W);
+  body.addColorStop(0, '#d94b3f');
+  body.addColorStop(0.5, '#b62f27');
+  body.addColorStop(1, '#8d1f1c');
+  ctx.fillStyle = body;
+  roundRect(ctx, x, y, L, W, 7);
+  ctx.fill();
+  ctx.strokeStyle = '#2b1112';
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+
+  // Racing stripes down the length of the car.
+  ctx.fillStyle = 'rgba(240,236,225,0.85)';
+  ctx.fillRect(x + 5, cy - 6.5, L - 16, 4);
+  ctx.fillRect(x + 5, cy + 2.5, L - 16, 4);
+
+  // Cabin glass.
+  ctx.fillStyle = '#1b2430';
+  roundRect(ctx, cx - 11, y + 4, 22, W - 8, 5);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(150,200,240,0.20)';
+  roundRect(ctx, cx - 9, y + 5.5, 8, W - 11, 3);
+  ctx.fill();
+
+  // Front bumper / push bar - this is the business end.
+  ctx.fillStyle = '#3a3d45';
+  roundRect(ctx, x + L - 9, y + 1, 8, W - 2, 3);
+  ctx.fill();
+  ctx.fillStyle = '#5a5f6b';
+  ctx.fillRect(x + L - 4, y + 3, 3, W - 6);
+
+  // Lights.
+  ctx.fillStyle = '#ffe9a8';
+  ctx.fillRect(x + L - 3.5, y + 3.5, 2.5, 5);
+  ctx.fillRect(x + L - 3.5, y + W - 8.5, 2.5, 5);
+  ctx.fillStyle = '#ff5a4a';
+  ctx.fillRect(x + 1, y + 4, 2, 4.5);
+  ctx.fillRect(x + 1, y + W - 8.5, 2, 4.5);
+
+  // Rear spoiler.
+  ctx.fillStyle = '#2b1112';
+  roundRect(ctx, x - 1, y + 2, 4, W - 4, 2);
+  ctx.fill();
+}
+
+function drawZombie(ctx, w, h, frame, rng) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const swing = Math.sin((frame / 4) * TAU);
+
+  // Contact shadow, so a body still reads when it is standing in gore.
+  ctx.fillStyle = 'rgba(0,0,0,0.34)';
+  ctx.beginPath();
+  ctx.ellipse(cx - 1, cy + 1, 8, 6.5, 0, 0, TAU);
+  ctx.fill();
+
+  const skin = ['#7d9a5e', '#6d8a52', '#88a06a', '#5f7f4c'][Math.floor(rng() * 4)];
+  const cloth = ['#3c4a44', '#4a3f38', '#33404d', '#4c4438'][Math.floor(rng() * 4)];
+
+  // Legs, trailing behind and shuffling out of phase.
+  ctx.strokeStyle = cloth;
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(cx - 2, cy + s * 3);
+    ctx.lineTo(cx - 8, cy + s * 4.5 + swing * s * 2.5);
+    ctx.stroke();
+  }
+
+  // Torso.
+  ctx.fillStyle = cloth;
+  ctx.beginPath();
+  ctx.ellipse(cx - 1, cy, 7, 6, 0, 0, TAU);
+  ctx.fill();
+
+  // Arms reaching forward - the classic silhouette.
+  ctx.strokeStyle = skin;
+  ctx.lineWidth = 3.4;
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(cx - 1, cy + s * 5);
+    ctx.quadraticCurveTo(cx + 5, cy + s * 6, cx + 9.5, cy + s * (3 + swing * s * 1.5));
+    ctx.stroke();
+  }
+
+  // Head.
+  ctx.fillStyle = skin;
+  ctx.beginPath();
+  ctx.arc(cx + 3.5, cy, 5.2, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(20,30,15,0.55)';
+  ctx.beginPath();
+  ctx.arc(cx + 6, cy - 1.8, 1.2, 0, TAU);
+  ctx.arc(cx + 6, cy + 1.8, 1.2, 0, TAU);
+  ctx.fill();
+
+  // A little gore already on the clothes.
+  ctx.fillStyle = 'rgba(120,20,22,0.5)';
+  ctx.beginPath();
+  ctx.arc(cx - 2 + rng() * 4, cy - 2 + rng() * 4, 1.8, 0, TAU);
+  ctx.fill();
+}
+
+function drawSkeleton(ctx, w, h, frame, rng) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const swing = Math.sin((frame / 4) * TAU);
+  // Contact shadow, so a body still reads when it is standing in gore.
+  ctx.fillStyle = 'rgba(0,0,0,0.30)';
+  ctx.beginPath();
+  ctx.ellipse(cx - 1, cy + 1, 7, 5.5, 0, 0, TAU);
+  ctx.fill();
+
+  const bone = ['#e2dcc4', '#d5cdb2', '#eae4cf'][Math.floor(rng() * 3)];
+
+  ctx.strokeStyle = bone;
+  ctx.lineCap = 'round';
+
+  // Legs.
+  ctx.lineWidth = 2.6;
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(cx - 2, cy + s * 2.5);
+    ctx.lineTo(cx - 7.5, cy + s * 4 + swing * s * 3);
+    ctx.stroke();
+  }
+
+  // Ribcage.
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(cx - 3 + i * 2.2, cy - 4.5);
+    ctx.lineTo(cx - 3 + i * 2.2, cy + 4.5);
+    ctx.stroke();
+  }
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - 4, cy);
+  ctx.lineTo(cx + 2, cy);
+  ctx.stroke();
+
+  // Clawing arms.
+  ctx.lineWidth = 2.2;
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(cx - 1, cy + s * 4);
+    ctx.quadraticCurveTo(cx + 4, cy + s * 5.5, cx + 9, cy + s * (2.5 + swing * s * 2));
+    ctx.stroke();
+  }
+
+  // Skull.
+  ctx.fillStyle = bone;
+  ctx.beginPath();
+  ctx.arc(cx + 3.5, cy, 4.6, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = '#22242a';
+  ctx.beginPath();
+  ctx.arc(cx + 5.4, cy - 1.7, 1.35, 0, TAU);
+  ctx.arc(cx + 5.4, cy + 1.7, 1.35, 0, TAU);
+  ctx.fill();
+}
+
+function drawMeat(ctx, w, h, rng) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const r = w * 0.38;
+  const pts = 9;
+  const dark = `hsl(${350 + rng() * 12}, ${52 + rng() * 18}%, ${13 + rng() * 8}%)`;
+  const mid = `hsl(${352 + rng() * 10}, ${60 + rng() * 15}%, ${24 + rng() * 9}%)`;
+
+  ctx.beginPath();
+  for (let i = 0; i <= pts; i++) {
+    const a = (i / pts) * TAU;
+    const rad = r * (0.62 + rng() * 0.55);
+    const x = cx + Math.cos(a) * rad;
+    const y = cy + Math.sin(a) * rad;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = mid;
+  ctx.fill();
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+
+  // Wet highlight so piles read as glistening rather than flat.
+  ctx.fillStyle = 'rgba(255,160,150,0.22)';
+  ctx.beginPath();
+  ctx.ellipse(cx - r * 0.2, cy - r * 0.25, r * 0.3, r * 0.2, rng() * TAU, 0, TAU);
+  ctx.fill();
+}
+
+function drawBone(ctx, w, h, rng) {
+  const cx = w / 2;
+  const cy = h / 2;
+  ctx.fillStyle = `hsl(${44 + rng() * 10}, 22%, ${74 + rng() * 12}%)`;
+  ctx.strokeStyle = 'rgba(60,50,40,0.5)';
+  ctx.lineWidth = 1;
+  const len = w * 0.42;
+  const th = h * 0.16;
+  roundRect(ctx, cx - len, cy - th, len * 2, th * 2, th);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx - len, cy, th * 1.5, 0, TAU);
+  ctx.arc(cx + len, cy, th * 1.5, 0, TAU);
+  ctx.fill();
+}
+
+function makeSprites() {
+  const rng = mulberry32(1337);
+
+  const carPad = 10;
+  const car = makeCanvas(CAR_LENGTH + carPad * 2, CAR_WIDTH + carPad * 2);
+  drawCar(car.ctx, car.canvas.w, car.canvas.h);
+
+  const ENEMY = 30;
+  const zombies = [];
+  const skeletons = [];
+  for (let f = 0; f < 4; f++) {
+    const z = makeCanvas(ENEMY, ENEMY);
+    drawZombie(z.ctx, ENEMY, ENEMY, f, mulberry32(90 + f));
+    zombies.push(z.canvas);
+
+    const s = makeCanvas(ENEMY, ENEMY);
+    drawSkeleton(s.ctx, ENEMY, ENEMY, f, mulberry32(300 + f));
+    skeletons.push(s.canvas);
+  }
+
+  // A handful of variants each, picked per chunk so piles are not repetitive.
+  const meat = [];
+  const bone = [];
+  for (let i = 0; i < 6; i++) {
+    const m = makeCanvas(32, 32);
+    drawMeat(m.ctx, 32, 32, mulberry32(500 + i));
+    meat.push(m.canvas);
+
+    const b = makeCanvas(24, 24);
+    drawBone(b.ctx, 24, 24, mulberry32(700 + i));
+    bone.push(b.canvas);
+  }
+
+  return { car: car.canvas, zombies, skeletons, meat, bone, enemySize: ENEMY, rng };
+}
+
+// ==================================================================
+// js/input.js
+// ==================================================================
+
+// Keyboard handling. Held keys drive the car; edge-triggered presses are
+// queued so a tap is never missed between frames.
+
+const THROTTLE = ['KeyW', 'ArrowUp'];
+const BRAKE = ['KeyS', 'ArrowDown'];
+const LEFT = ['KeyA', 'ArrowLeft'];
+const RIGHT = ['KeyD', 'ArrowRight'];
+const SWALLOW = new Set([
+  ...THROTTLE, ...BRAKE, ...LEFT, ...RIGHT,
+  'Space', 'ShiftLeft', 'ShiftRight', 'KeyP', 'KeyM', 'Enter', 'KeyR',
+]);
+
+class Input {
+  constructor(target = window) {
+    this.down = new Set();
+    this.presses = new Set();
+
+    target.addEventListener('keydown', (e) => {
+      if (SWALLOW.has(e.code)) e.preventDefault();
+      if (e.repeat) return;           // no auto-repeat on edge events
+      this.down.add(e.code);
+      this.presses.add(e.code);
+    });
+    target.addEventListener('keyup', (e) => {
+      if (SWALLOW.has(e.code)) e.preventDefault();
+      this.down.delete(e.code);
+    });
+    target.addEventListener('blur', () => this.down.clear());
+  }
+
+  held(codes) {
+    for (const c of codes) if (this.down.has(c)) return true;
+    return false;
+  }
+
+  /** True once per physical key press. */
+  pressed(...codes) {
+    for (const c of codes) {
+      if (this.presses.has(c)) {
+        this.presses.delete(c);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  anyPressed() {
+    return this.presses.size > 0;
+  }
+
+  endFrame() {
+    this.presses.clear();
+  }
+
+  read() {
+    let throttle = 0;
+    let steer = 0;
+    if (this.held(THROTTLE)) throttle += 1;
+    if (this.held(BRAKE)) throttle -= 1;
+    if (this.held(LEFT)) steer -= 1;
+    if (this.held(RIGHT)) steer += 1;
+    return { throttle, steer };
+  }
+}
+
+// ==================================================================
+// js/audio.js
+// ==================================================================
+
+// Procedural audio - no asset files. An engine drone whose pitch tracks the
+// revs, plus short synthesised hits for splats, bone and sheet metal.
+
+const MAX_HITS_PER_FRAME = 3;
+
+class GameAudio {
+  constructor() {
+    this.ctx = null;
+    this.muted = false;
+    this.started = false;
+    this.hitsThisFrame = 0;
+    this.lastSplat = 0;
+  }
+
+  /** Must be called from a user gesture - browsers block audio otherwise. */
+  resume() {
+    if (this.ctx === null) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      this._build();
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  }
+
+  _build() {
+    const ctx = this.ctx;
+    this.master = ctx.createGain();
+    this.master.gain.value = 0.9;
+    this.master.connect(ctx.destination);
+
+    // Shared noise buffer for all the percussive hits.
+    const len = Math.floor(ctx.sampleRate * 0.5);
+    this.noise = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = this.noise.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+
+    // Engine: two detuned saws through a low-pass that opens with the revs.
+    this.engineGain = ctx.createGain();
+    this.engineGain.gain.value = 0;
+    this.engineFilter = ctx.createBiquadFilter();
+    this.engineFilter.type = 'lowpass';
+    this.engineFilter.frequency.value = 400;
+    this.engineFilter.Q.value = 3;
+    this.engineGain.connect(this.engineFilter);
+    this.engineFilter.connect(this.master);
+
+    this.osc = [];
+    for (const [type, detune, gain] of [['sawtooth', 0, 0.5], ['sawtooth', 7, 0.35], ['square', -1200, 0.2]]) {
+      const o = ctx.createOscillator();
+      o.type = type;
+      o.detune.value = detune;
+      const g = ctx.createGain();
+      g.gain.value = gain;
+      o.connect(g);
+      g.connect(this.engineGain);
+      o.start();
+      this.osc.push(o);
+    }
+    this.started = true;
+  }
+
+  _noiseBurst(dur, freq, type, gain, decay = 1) {
+    const ctx = this.ctx;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noise;
+    src.playbackRate.value = 0.6 + Math.random() * 0.8;
+    const f = ctx.createBiquadFilter();
+    f.type = type;
+    f.frequency.value = freq;
+    const g = ctx.createGain();
+    const t = ctx.currentTime;
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur * decay);
+    src.connect(f);
+    f.connect(g);
+    g.connect(this.master);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+  }
+
+  beginFrame() {
+    this.hitsThisFrame = 0;
+  }
+
+  engine(rpm, gearLow, load) {
+    if (!this.started || this.muted) return;
+    const base = gearLow ? 62 : 44;
+    const f = base + rpm * (gearLow ? 150 : 190);
+    const t = this.ctx.currentTime;
+    for (const o of this.osc) o.frequency.setTargetAtTime(f, t, 0.05);
+    this.engineFilter.frequency.setTargetAtTime(320 + rpm * 1500 + load * 300, t, 0.08);
+    this.engineGain.gain.setTargetAtTime(0.035 + rpm * 0.05, t, 0.1);
+  }
+
+  idle() {
+    if (!this.started) return;
+    this.engineGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.15);
+  }
+
+  splat(power) {
+    if (!this.started || this.muted) return;
+    if (this.hitsThisFrame >= MAX_HITS_PER_FRAME) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastSplat < 0.035) return;
+    this.lastSplat = now;
+    this.hitsThisFrame++;
+    this._noiseBurst(0.16, 300 + clamp(power, 0, 600) * 0.5, 'lowpass', 0.30);
+  }
+
+  bone() {
+    if (!this.started || this.muted) return;
+    if (this.hitsThisFrame >= MAX_HITS_PER_FRAME) return;
+    this.hitsThisFrame++;
+    this._noiseBurst(0.09, 2600, 'highpass', 0.16, 0.7);
+  }
+
+  crash(force) {
+    if (!this.started || this.muted) return;
+    this._noiseBurst(0.45, 220, 'lowpass', clamp(force / 500, 0.15, 0.6));
+    const ctx = this.ctx;
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    const g = ctx.createGain();
+    const t = ctx.currentTime;
+    o.frequency.setValueAtTime(120, t);
+    o.frequency.exponentialRampToValueAtTime(40, t + 0.3);
+    g.gain.setValueAtTime(0.35, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + 0.4);
+  }
+
+  shift() {
+    if (!this.started || this.muted) return;
+    this._noiseBurst(0.07, 1400, 'bandpass', 0.14, 0.6);
+  }
+
+  death() {
+    if (!this.started || this.muted) return;
+    this.crash(600);
+    this._noiseBurst(1.2, 160, 'lowpass', 0.4);
+  }
+
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.started) {
+      this.master.gain.setTargetAtTime(this.muted ? 0 : 0.9, this.ctx.currentTime, 0.05);
+    }
+    return this.muted;
+  }
+}
+
+// ==================================================================
+// js/render.js
+// ==================================================================
+
+// All drawing lives here. The simulation never touches the canvas.
+
+
+
+
+
+
+const ROAD_COLOR = '#26272d';
+const SIDEWALK = '#41434c';
+const PARK = '#2c3b2b';
+const LOT = '#313239';
+const LINE = 'rgba(206,180,88,0.55)';
+
+const TILE_WORLD = 1024;   // world units covered by one decal tile
+const TILE_PX = 512;       // half-resolution: blood does not need to be sharp
+const MAX_TILES = 28;
+
+/**
+ * Persistent blood staining, baked into a sparse grid of offscreen tiles so
+ * the trail you carve through the city survives long after the chunks that
+ * made it have been recycled.
+ */
+class DecalLayer {
+  constructor() {
+    this.tiles = new Map();
+    this.rng = mulberry32(4242);
+  }
+
+  clear() {
+    this.tiles.clear();
+  }
+
+  _tile(tx, ty, frame) {
+    const key = tx * 8192 + ty;
+    let t = this.tiles.get(key);
+    if (t === undefined) {
+      if (this.tiles.size >= MAX_TILES) {
+        // Drop whichever tile has gone unseen the longest.
+        let oldest = null;
+        let oldestFrame = Infinity;
+        for (const [k, v] of this.tiles) {
+          if (v.seen < oldestFrame) { oldestFrame = v.seen; oldest = k; }
+        }
+        if (oldest !== null) this.tiles.delete(oldest);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = TILE_PX;
+      canvas.height = TILE_PX;
+      const ctx = canvas.getContext('2d');
+      const s = TILE_PX / TILE_WORLD;
+      ctx.setTransform(s, 0, 0, s, -tx * TILE_WORLD * s, -ty * TILE_WORLD * s);
+      t = { canvas, ctx, seen: frame };
+      this.tiles.set(key, t);
+    }
+    t.seen = frame;
+    return t;
+  }
+
+  /** Paint one kill's stain into every tile it touches. */
+  splat(s, frame) {
+    const rng = this.rng;
+    const r = s.r;
+    const x0 = Math.floor((s.x - r) / TILE_WORLD);
+    const x1 = Math.floor((s.x + r) / TILE_WORLD);
+    const y0 = Math.floor((s.y - r) / TILE_WORLD);
+    const y1 = Math.floor((s.y + r) / TILE_WORLD);
+
+    // Same shape drawn into each overlapping tile, so seams do not show.
+    const blobs = [];
+    const n = 5 + Math.floor(rng() * 5);
+    for (let i = 0; i < n; i++) {
+      const a = rng() * TAU;
+      const d = rng() * r * 0.55;
+      blobs.push([s.x + Math.cos(a) * d, s.y + Math.sin(a) * d, r * (0.22 + rng() * 0.42)]);
+    }
+    const streaks = [];
+    const sn = 4 + Math.floor(rng() * 6);
+    for (let i = 0; i < sn; i++) {
+      const spread = (rng() - 0.5) * 1.1;
+      const dist = r * (0.6 + rng() * 2.2) * (0.4 + s.power / 500);
+      const ca = Math.cos(spread);
+      const sa = Math.sin(spread);
+      const dx = s.dirx * ca - s.diry * sa;
+      const dy = s.dirx * sa + s.diry * ca;
+      streaks.push([s.x + dx * dist, s.y + dy * dist, r * (0.07 + rng() * 0.16)]);
+    }
+
+    const bone = s.kind !== MEAT;
+    const hue = bone ? 40 : 356;
+    const sat = bone ? 18 : 62;
+    const light = bone ? 60 : 15 + s.tone * 8;
+
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        const t = this._tile(tx, ty, frame);
+        const ctx = t.ctx;
+        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light}%, ${bone ? 0.28 : 0.5})`;
+        for (const [bx, by, br] of blobs) {
+          ctx.beginPath();
+          ctx.arc(bx, by, br, 0, TAU);
+          ctx.fill();
+        }
+        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light + 4}%, ${bone ? 0.2 : 0.38})`;
+        for (const [sx, sy, sr] of streaks) {
+          ctx.beginPath();
+          ctx.arc(sx, sy, sr, 0, TAU);
+          ctx.fill();
+        }
+      }
+    }
+  }
+
+  draw(ctx, view, frame) {
+    const x0 = Math.floor(view.x / TILE_WORLD);
+    const x1 = Math.floor((view.x + view.w) / TILE_WORLD);
+    const y0 = Math.floor(view.y / TILE_WORLD);
+    const y1 = Math.floor((view.y + view.h) / TILE_WORLD);
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        const t = this.tiles.get(tx * 8192 + ty);
+        if (t === undefined) continue;
+        t.seen = frame;
+        ctx.drawImage(t.canvas, tx * TILE_WORLD, ty * TILE_WORLD, TILE_WORLD, TILE_WORLD);
+      }
+    }
+  }
+}
+
+class Renderer {
+  constructor(canvas, sprites) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d', { alpha: false });
+    this.sprites = sprites;
+    this.decals = new DecalLayer();
+    this.cam = { x: 0, y: 0, zoom: 1.12 };
+    this.dpr = 1;
+    this.frame = 0;
+    this.hurtFlash = 0;
+    this.shiftHint = 0;
+    this.view = { x: 0, y: 0, w: 0, h: 0 };
+    this.gradients = null;
+    this.resize();
+  }
+
+  resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = this.canvas.clientWidth || window.innerWidth;
+    const h = this.canvas.clientHeight || window.innerHeight;
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.dpr = dpr;
+    this.w = w;
+    this.h = h;
+    this.gradients = null; // rebuilt lazily at the new size
+  }
+
+  _gradients() {
+    if (this.gradients !== null) return this.gradients;
+    const ctx = this.ctx;
+    const W = this.w;
+    const H = this.h;
+    const vignette = ctx.createRadialGradient(
+      W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+    vignette.addColorStop(0, 'rgba(0,0,0,0)');
+    vignette.addColorStop(1, 'rgba(0,0,0,0.55)');
+    // Danger wash is drawn at full strength and faded with globalAlpha.
+    const danger = ctx.createRadialGradient(
+      W / 2, H / 2, Math.min(W, H) * 0.42, W / 2, H / 2, Math.max(W, H) * 0.62);
+    danger.addColorStop(0, 'rgba(140,0,0,0)');
+    danger.addColorStop(1, 'rgba(140,0,0,1)');
+    this.gradients = { vignette, danger };
+    return this.gradients;
+  }
+
+  reset() {
+    this.decals.clear();
+  }
+
+  /** Camera chases the car with a lead in the direction of travel. */
+  updateCamera(game, dt) {
+    const car = game.car;
+    const speed = Math.hypot(car.vx, car.vy);
+    const lead = clamp(speed * 0.35, 0, 190);
+    const tx = car.x + Math.cos(car.ang) * lead;
+    const ty = car.y + Math.sin(car.ang) * lead;
+    const k = 1 - Math.exp(-6 * dt);
+    this.cam.x += (tx - this.cam.x) * k;
+    this.cam.y += (ty - this.cam.y) * k;
+
+    // Pull back a little as you gain speed so you can see what you are hitting.
+    const targetZoom = 1.12 - 0.24 * clamp(speed / 660, 0, 1);
+    this.cam.zoom += (targetZoom - this.cam.zoom) * (1 - Math.exp(-3 * dt));
+  }
+
+  /** Set the canvas transform to world space, including shake. */
+  worldTransform(game) {
+    const z = this.cam.zoom * this.dpr;
+    const shake = game.shake;
+    const sx = shake > 0.01 ? (Math.random() - 0.5) * shake * 2 : 0;
+    const sy = shake > 0.01 ? (Math.random() - 0.5) * shake * 2 : 0;
+    this.ctx.setTransform(
+      z, 0, 0, z,
+      (this.w * 0.5 + sx) * this.dpr - this.cam.x * z,
+      (this.h * 0.5 + sy) * this.dpr - this.cam.y * z,
+    );
+  }
+
+  computeView() {
+    const halfW = this.w / (2 * this.cam.zoom);
+    const halfH = this.h / (2 * this.cam.zoom);
+    const m = 90;
+    this.view.x = this.cam.x - halfW - m;
+    this.view.y = this.cam.y - halfH - m;
+    this.view.w = halfW * 2 + m * 2;
+    this.view.h = halfH * 2 + m * 2;
+    return this.view;
+  }
+
+  render(game, dt) {
+    this.frame++;
+    this.updateCamera(game, dt);
+    const ctx = this.ctx;
+    const view = this.computeView();
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = ROAD_COLOR;
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    this.worldTransform(game);
+    this.drawGround(game, view);
+    for (const s of game.gore.splats) this.decals.splat(s, this.frame);
+    game.gore.splats.length = 0;
+    this.decals.draw(ctx, view, this.frame);
+    this.drawGore(game, view);
+    this.drawParticles(game, view);
+    this.drawEnemies(game, view);
+    this.drawCar(game);
+    this.drawBuildings(game, view);
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(this.dpr, this.dpr);
+    this.drawHud(game, dt);
+  }
+
+  // ---- world ------------------------------------------------------------
+
+  drawGround(game, view) {
+    const ctx = this.ctx;
+    const city = game.city;
+    const c0x = Math.max(0, Math.floor(view.x / CELL));
+    const c1x = Math.min(city.cols - 1, Math.floor((view.x + view.w) / CELL));
+    const c0y = Math.max(0, Math.floor(view.y / CELL));
+    const c1y = Math.min(city.rows - 1, Math.floor((view.y + view.h) / CELL));
+
+    for (let cy = c0y; cy <= c1y; cy++) {
+      for (let cx = c0x; cx <= c1x; cx++) {
+        const b = city.blocks[cy * city.cols + cx];
+        if (b === undefined) continue;
+        ctx.fillStyle = SIDEWALK;
+        ctx.fillRect(b.x - 10, b.y - 10, b.w + 20, b.h + 20);
+        ctx.fillStyle = b.type === 'park' ? PARK : b.type === 'lot' ? LOT : '#3a3c44';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+      }
+    }
+
+    // Lane markings down the middle of each street.
+    ctx.strokeStyle = LINE;
+    ctx.lineWidth = 3;
+    ctx.setLineDash([26, 22]);
+    ctx.beginPath();
+    for (let cx = c0x; cx <= c1x + 1; cx++) {
+      const x = cx * CELL;
+      ctx.moveTo(x, Math.max(0, view.y));
+      ctx.lineTo(x, Math.min(city.height, view.y + view.h));
+    }
+    for (let cy = c0y; cy <= c1y + 1; cy++) {
+      const y = cy * CELL;
+      ctx.moveTo(Math.max(0, view.x), y);
+      ctx.lineTo(Math.min(city.width, view.x + view.w), y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Crosswalk stripes on the approaches to each intersection.
+    ctx.fillStyle = 'rgba(220,220,220,0.16)';
+    const half = ROAD * 0.5;
+    for (let cy = c0y; cy <= c1y + 1; cy++) {
+      for (let cx = c0x; cx <= c1x + 1; cx++) {
+        const ix = cx * CELL;
+        const iy = cy * CELL;
+        for (let i = 0; i < 5; i++) {
+          const o = -half + 12 + i * 26;
+          ctx.fillRect(ix + o, iy - half - 16, 16, 12);
+          ctx.fillRect(ix + o, iy + half + 4, 16, 12);
+          ctx.fillRect(ix - half - 16, iy + o, 12, 16);
+          ctx.fillRect(ix + half + 4, iy + o, 12, 16);
+        }
+      }
+    }
+  }
+
+  drawBuildings(game, view) {
+    const ctx = this.ctx;
+    const city = game.city;
+    const c0x = Math.max(-1, Math.floor(view.x / CELL));
+    const c1x = Math.min(city.cols, Math.floor((view.x + view.w) / CELL));
+    const c0y = Math.max(-1, Math.floor(view.y / CELL));
+    const c1y = Math.min(city.rows, Math.floor((view.y + view.h) / CELL));
+    const cam = this.cam;
+
+    for (let cy = c0y; cy <= c1y; cy++) {
+      for (let cx = c0x; cx <= c1x; cx++) {
+        const list = city.grid.get(cx * 8192 + cy);
+        if (list === undefined) continue;
+        for (let i = 0; i < list.length; i++) {
+          const s = list[i];
+          const mx = s.x + s.w * 0.5;
+          const my = s.y + s.h * 0.5;
+          // Fake parallax extrusion: taller things lean further from centre.
+          // Clamped to the footprint so a narrow building's roof still sits on
+          // its own walls instead of sliding off like a dropped card.
+          const k = s.top / 1050;
+          const dx = clamp((mx - cam.x) * k, -s.w * 0.42, s.w * 0.42);
+          const dy = clamp((my - cam.y) * k, -s.h * 0.42, s.h * 0.42);
+
+          if (s.kind === 'tree') {
+            const r = s.w * 0.5;
+            ctx.fillStyle = 'rgba(0,0,0,0.30)';
+            ctx.beginPath();
+            ctx.arc(mx + dx * 0.6 + 9, my + dy * 0.6 + 12, r, 0, TAU);
+            ctx.fill();
+            ctx.fillStyle = s.wall;
+            ctx.beginPath();
+            ctx.arc(mx + dx * 0.5, my + dy * 0.5, r * 0.95, 0, TAU);
+            ctx.fill();
+            ctx.fillStyle = s.roof;
+            ctx.beginPath();
+            ctx.arc(mx + dx, my + dy, r * 0.8, 0, TAU);
+            ctx.fill();
+            continue;
+          }
+
+          ctx.fillStyle = 'rgba(0,0,0,0.32)';
+          ctx.fillRect(s.x + dx * 0.5 + 10, s.y + dy * 0.5 + 13, s.w, s.h);
+
+          ctx.fillStyle = s.wall;
+          ctx.fillRect(s.x, s.y, s.w, s.h);
+
+          ctx.fillStyle = s.roof;
+          ctx.fillRect(s.x + dx, s.y + dy, s.w, s.h);
+
+          if (s.kind === 'building') {
+            ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(s.x + dx + 1, s.y + dy + 1, s.w - 2, s.h - 2);
+            if (s.w > 70 && s.h > 70) {
+              ctx.fillStyle = 'rgba(0,0,0,0.16)';
+              ctx.fillRect(s.x + dx + s.w * 0.22, s.y + dy + s.h * 0.22, s.w * 0.3, s.h * 0.22);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  drawEnemies(game, view) {
+    const ctx = this.ctx;
+    const sp = this.sprites;
+    const size = sp.enemySize;
+    const half = size * 0.5;
+    const z = this.cam.zoom * this.dpr;
+    const ox = (this.w * 0.5) * this.dpr - this.cam.x * z;
+    const oy = (this.h * 0.5) * this.dpr - this.cam.y * z;
+    const list = game.swarm.active;
+    const vx0 = view.x;
+    const vy0 = view.y;
+    const vx1 = view.x + view.w;
+    const vy1 = view.y + view.h;
+
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i];
+      if (e.x < vx0 || e.x > vx1 || e.y < vy0 || e.y > vy1) continue;
+      const frames = e.kind === ZOMBIE ? sp.zombies : sp.skeletons;
+      const img = frames[(e.phase * 1.4 | 0) & 3];
+      const cos = Math.cos(e.ang);
+      const sin = Math.sin(e.ang);
+      ctx.setTransform(
+        z * cos, z * sin, -z * sin, z * cos,
+        e.x * z + ox, e.y * z + oy,
+      );
+      ctx.drawImage(img, -half, -half, size, size);
+    }
+    this.worldTransform(game);
+  }
+
+  drawGore(game, view) {
+    const ctx = this.ctx;
+    const sp = this.sprites;
+    const z = this.cam.zoom * this.dpr;
+    const ox = (this.w * 0.5) * this.dpr - this.cam.x * z;
+    const oy = (this.h * 0.5) * this.dpr - this.cam.y * z;
+    const chunks = game.gore.chunks;
+    const vx0 = view.x;
+    const vy0 = view.y;
+    const vx1 = view.x + view.w;
+    const vy1 = view.y + view.h;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      if (!c.live) continue;
+      if (c.x < vx0 || c.x > vx1 || c.y < vy0 || c.y > vy1) continue;
+      const img = c.type === MEAT ? sp.meat[c.shape % sp.meat.length] : sp.bone[c.shape % sp.bone.length];
+      const s = c.r * 3.0;
+      const cos = Math.cos(c.rot);
+      const sin = Math.sin(c.rot);
+      ctx.setTransform(
+        z * cos, z * sin, -z * sin, z * cos,
+        c.x * z + ox, c.y * z + oy,
+      );
+      ctx.drawImage(img, -s * 0.5, -s * 0.5, s, s);
+    }
+    this.worldTransform(game);
+  }
+
+  drawParticles(game, view) {
+    const ctx = this.ctx;
+    const arr = game.particles;
+    for (let i = 0; i < arr.length; i++) {
+      const p = arr[i];
+      if (!p.live) continue;
+      if (p.x < view.x || p.x > view.x + view.w || p.y < view.y || p.y > view.y + view.h) continue;
+      const a = clamp(p.life / p.max, 0, 1);
+      if (p.kind === 0) ctx.fillStyle = `hsla(356, 70%, ${22 + p.tone * 14}%, ${a})`;
+      else if (p.kind === 1) ctx.fillStyle = `hsla(44, 20%, ${72 + p.tone * 12}%, ${a})`;
+      else ctx.fillStyle = `hsla(38, 95%, ${60 + p.tone * 25}%, ${a})`;
+      const s = p.size * (0.5 + a * 0.7);
+      ctx.fillRect(p.x - s * 0.5, p.y - s * 0.5, s, s);
+    }
+  }
+
+  drawCar(game) {
+    const ctx = this.ctx;
+    const car = game.car;
+    const img = this.sprites.car;
+    const z = this.cam.zoom * this.dpr;
+    const ox = (this.w * 0.5) * this.dpr - this.cam.x * z;
+    const oy = (this.h * 0.5) * this.dpr - this.cam.y * z;
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+
+    ctx.setTransform(z * cos, z * sin, -z * sin, z * cos, car.x * z + ox, car.y * z + oy);
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
+    ctx.fillRect(-CAR_LENGTH * 0.5 + 5, -CAR_WIDTH * 0.5 + 7, CAR_LENGTH, CAR_WIDTH);
+    ctx.drawImage(img, -img.w * 0.5, -img.h * 0.5, img.w, img.h);
+    this.worldTransform(game);
+  }
+
+  // ---- hud ---------------------------------------------------------------
+
+  drawHud(game, dt) {
+    const ctx = this.ctx;
+    const W = this.w;
+    const H = this.h;
+
+    for (const ev of game.events) {
+      if (ev.type === 'hurt') this.hurtFlash = Math.min(1, this.hurtFlash + ev.amount * dt * 0.12);
+      if (ev.type === 'crash') this.hurtFlash = Math.min(1, this.hurtFlash + 0.35);
+    }
+    this.hurtFlash *= Math.exp(-2.2 * dt);
+
+    // Vignette, plus a red wash while they are on you.
+    const grad = this._gradients();
+    ctx.fillStyle = grad.vignette;
+    ctx.fillRect(0, 0, W, H);
+
+    // Kept to the edges of the screen: you still need to see what you are driving at.
+    const danger = Math.max(this.hurtFlash, game.grabbers > 0 ? clamp(game.grabbers / 18, 0, 0.6) : 0);
+    if (danger > 0.01) {
+      ctx.save();
+      ctx.globalAlpha = danger * 0.45;
+      ctx.fillStyle = grad.danger;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+
+    if (game.state === 'title') { this.drawTitle(game); return; }
+    if (game.state === 'dead') { this.drawGameOver(game); return; }
+
+    this.drawStats(game);
+    this.drawSpeedo(game, dt);
+    this.drawPressure(game, dt);
+    this.drawMinimap(game);
+
+    if (game.combo >= 3) {
+      const pop = clamp(game.comboTimer / 1.4, 0, 1);
+      ctx.save();
+      ctx.textAlign = 'center';
+      ctx.globalAlpha = 0.3 + pop * 0.7;
+      ctx.fillStyle = '#ffd166';
+      ctx.font = `700 ${34 + game.combo * 0.35}px Impact, "Arial Narrow", sans-serif`;
+      ctx.fillText(`${game.combo} SPLATTERED`, W / 2, 92);
+      ctx.restore();
+    }
+  }
+
+  drawStats(game) {
+    const ctx = this.ctx;
+    const x = 24;
+    let y = 34;
+
+    ctx.textAlign = 'left';
+    ctx.font = '600 12px ui-monospace, "SF Mono", Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText('CHASSIS', x, y - 14);
+
+    const w = 250;
+    const hp = game.health / MAX_HEALTH;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(x - 2, y - 2, w + 4, 18);
+    ctx.fillStyle = hp > 0.5 ? '#5fd07a' : hp > 0.25 ? '#e8c04a' : '#e05252';
+    ctx.fillRect(x, y, w * hp, 14);
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 10; i++) {
+      ctx.beginPath();
+      ctx.moveTo(x + (w / 10) * i, y);
+      ctx.lineTo(x + (w / 10) * i, y + 14);
+      ctx.stroke();
+    }
+
+    y += 42;
+    const killText = `${game.kills}`;
+    ctx.font = '700 26px Impact, "Arial Narrow", sans-serif';
+    ctx.fillStyle = '#f2efe6';
+    ctx.fillText(killText, x, y);
+    const killWidth = ctx.measureText(killText).width;
+    ctx.font = '600 12px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText('RUN OVER', x + killWidth + 10, y);
+
+    y += 22;
+    const mins = Math.floor(game.time / 60);
+    const secs = Math.floor(game.time % 60);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText(`TIME ${mins}:${secs.toString().padStart(2, '0')}`, x, y);
+    y += 18;
+    ctx.fillText(`SCORE ${game.totalScore}`, x, y);
+    y += 18;
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillText(`HORDE ${game.swarm.count}`, x, y);
+  }
+
+  drawSpeedo(game, dt) {
+    const ctx = this.ctx;
+    const cx = 96;
+    const cy = this.h - 96;
+    const r = 62;
+    const car = game.car;
+    const speed = Math.abs(car.speed);
+    const maxAll = GEARS[GEAR_HIGH].maxSpeed;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    ctx.fillStyle = 'rgba(10,11,14,0.72)';
+    ctx.beginPath();
+    ctx.arc(0, 0, r + 8, 0, TAU);
+    ctx.fill();
+
+    const a0 = Math.PI * 0.75;
+    const a1 = Math.PI * 2.25;
+
+    // Redline segment for whatever the current gear cannot pull past.
+    const gearMax = GEARS[car.gear].maxSpeed / maxAll;
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 8;
+    ctx.beginPath();
+    ctx.arc(0, 0, r - 6, a0, a1);
+    ctx.stroke();
+    ctx.strokeStyle = car.gear === GEAR_LOW ? 'rgba(255,176,64,0.85)' : 'rgba(90,200,255,0.85)';
+    ctx.beginPath();
+    ctx.arc(0, 0, r - 6, a0, a0 + (a1 - a0) * clamp(speed / maxAll, 0, 1));
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,80,80,0.5)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(0, 0, r + 1, a0 + (a1 - a0) * gearMax, a1);
+    ctx.stroke();
+
+    ctx.fillStyle = '#f4f1e8';
+    ctx.textAlign = 'center';
+    ctx.font = '700 30px Impact, "Arial Narrow", sans-serif';
+    ctx.fillText(`${Math.round(speed * KMH_PER_PX)}`, 0, 2);
+    ctx.font = '600 10px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillText('KM/H', 0, 16);
+
+    // Gear.
+    const low = car.gear === GEAR_LOW;
+    ctx.font = '700 22px Impact, "Arial Narrow", sans-serif';
+    ctx.fillStyle = low ? '#ffb040' : '#5ac8ff';
+    ctx.fillText(low ? 'LOW' : 'HIGH', 0, r + 4);
+    ctx.font = '600 9px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillText('SHIFT · SPACE', 0, r + 18);
+    ctx.restore();
+
+    // Prompt when high gear is about to get you killed.
+    const bogged = game.crowd > 0.45 && car.gear === GEAR_HIGH && speed < 190;
+    this.shiftHint = bogged
+      ? Math.min(1, this.shiftHint + dt * 4)
+      : Math.max(0, this.shiftHint - dt * 4);
+    if (this.shiftHint > 0.01) {
+      ctx.save();
+      ctx.globalAlpha = this.shiftHint * (0.65 + 0.35 * Math.sin(this.frame * 0.25));
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ffb040';
+      ctx.font = '700 30px Impact, "Arial Narrow", sans-serif';
+      ctx.fillText('SHIFT DOWN', this.w / 2, this.h - 132);
+      ctx.restore();
+    }
+  }
+
+  drawPressure(game, dt) {
+    const ctx = this.ctx;
+    const w = 320;
+    const x = this.w / 2 - w / 2;
+    const y = this.h - 58;
+    const p = clamp(game.crowd, 0, 1);
+
+    ctx.fillStyle = 'rgba(10,11,14,0.7)';
+    ctx.fillRect(x - 3, y - 3, w + 6, 20);
+    const g = ctx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0, '#5fd07a');
+    g.addColorStop(0.5, '#e8c04a');
+    g.addColorStop(1, '#e05252');
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y, w * p, 14);
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - 3, y - 3, w + 6, 20);
+
+    ctx.textAlign = 'center';
+    ctx.font = '600 11px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('SWARM PRESSURE', this.w / 2, y - 8);
+  }
+
+  drawMinimap(game) {
+    const ctx = this.ctx;
+    const size = 168;
+    const pad = 22;
+    const x = this.w - size - pad;
+    const y = this.h - size - pad;
+    const range = 2100;
+    const s = size / (range * 2);
+    const car = game.car;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(8,9,12,0.78)';
+    ctx.fillRect(x, y, size, size);
+    ctx.beginPath();
+    ctx.rect(x, y, size, size);
+    ctx.clip();
+    ctx.translate(x + size / 2, y + size / 2);
+    ctx.scale(s, s);
+    ctx.translate(-car.x, -car.y);
+
+    // City blocks.
+    const city = game.city;
+    ctx.fillStyle = 'rgba(90,95,110,0.55)';
+    const c0x = Math.max(0, Math.floor((car.x - range) / CELL));
+    const c1x = Math.min(city.cols - 1, Math.floor((car.x + range) / CELL));
+    const c0y = Math.max(0, Math.floor((car.y - range) / CELL));
+    const c1y = Math.min(city.rows - 1, Math.floor((car.y + range) / CELL));
+    for (let cy = c0y; cy <= c1y; cy++) {
+      for (let cx = c0x; cx <= c1x; cx++) {
+        const b = city.blocks[cy * city.cols + cx];
+        if (b) ctx.fillRect(b.x, b.y, b.w, b.h);
+      }
+    }
+
+    // Horde, sampled - a dot per third enemy is plenty to read density.
+    const list = game.swarm.active;
+    ctx.fillStyle = 'rgba(226,80,72,0.9)';
+    for (let i = 0; i < list.length; i += 3) {
+      const e = list[i];
+      ctx.fillRect(e.x - 14, e.y - 14, 28, 28);
+    }
+
+    // You.
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.ang);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(90, 0);
+    ctx.lineTo(-60, -60);
+    ctx.lineTo(-60, 60);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, size, size);
+  }
+
+  drawPaused() {
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(this.dpr, this.dpr);
+    ctx.fillStyle = 'rgba(6,7,10,0.6)';
+    ctx.fillRect(0, 0, this.w, this.h);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f2efe6';
+    ctx.font = '700 64px Impact, "Arial Narrow", sans-serif';
+    ctx.fillText('PAUSED', this.w / 2, this.h / 2);
+    ctx.font = '600 14px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('press P to keep driving', this.w / 2, this.h / 2 + 30);
+  }
+
+  drawTitle(game) {
+    const ctx = this.ctx;
+    const W = this.w;
+    const H = this.h;
+    ctx.fillStyle = 'rgba(6,7,10,0.62)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#e8452f';
+    ctx.font = `700 ${Math.min(112, W * 0.13)}px Impact, "Arial Narrow", sans-serif`;
+    ctx.fillText('SLICK STREETS', W / 2, H * 0.32);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = '600 15px ui-monospace, Menlo, monospace';
+    ctx.fillText('the city is full. clear a path.', W / 2, H * 0.32 + 34);
+
+    const lines = [
+      ['W / ↑', 'throttle'],
+      ['S / ↓', 'brake · reverse'],
+      ['A D / ← →', 'steer'],
+      ['SPACE or SHIFT', 'change gear'],
+      ['LOW gear', 'torque — claws you out of a swarm'],
+      ['HIGH gear', 'top speed — but it bogs down in a crowd'],
+      ['P', 'pause    ·    M  mute'],
+    ];
+    // Panel behind the key list so it stays readable over the city.
+    const panelH = lines.length * 25 + 30;
+    const panelW = Math.min(620, W * 0.8);
+    ctx.fillStyle = 'rgba(8,9,12,0.72)';
+    ctx.fillRect(W / 2 - panelW / 2, H * 0.5 - 32, panelW, panelH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(W / 2 - panelW / 2, H * 0.5 - 32, panelW, panelH);
+
+    ctx.font = '600 14px ui-monospace, Menlo, monospace';
+    let y = H * 0.5;
+    for (const [k, v] of lines) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#ffb040';
+      ctx.fillText(k, W / 2 - 18, y);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText(v, W / 2 + 18, y);
+      y += 25;
+    }
+
+    if (game.bestScore > 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '600 13px ui-monospace, Menlo, monospace';
+      ctx.fillText(`BEST RUN  ${game.bestScore}`, W / 2, H * 0.78);
+    }
+
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(this.frame * 0.06);
+    ctx.fillStyle = '#f2efe6';
+    ctx.font = '700 26px Impact, "Arial Narrow", sans-serif';
+    ctx.fillText('PRESS ENTER TO DRIVE', W / 2, H * 0.86);
+    ctx.globalAlpha = 1;
+  }
+
+  drawGameOver(game) {
+    const ctx = this.ctx;
+    const W = this.w;
+    const H = this.h;
+    ctx.fillStyle = 'rgba(30,4,4,0.66)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#e8452f';
+    ctx.font = `700 ${Math.min(96, W * 0.11)}px Impact, "Arial Narrow", sans-serif`;
+    ctx.fillText('YOU STOPPED', W / 2, H * 0.3);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '600 15px ui-monospace, Menlo, monospace';
+    ctx.fillText(game.deathCause, W / 2, H * 0.3 + 32);
+
+    const mins = Math.floor(game.time / 60);
+    const secs = Math.floor(game.time % 60);
+    const rows = [
+      ['SCORE', `${game.totalScore}`],
+      ['SURVIVED', `${mins}:${secs.toString().padStart(2, '0')}`],
+      ['ZOMBIES', `${game.zombieKills}`],
+      ['SKELETONS', `${game.skeletonKills}`],
+      ['BEST CHAIN', `${game.bestCombo}`],
+      ['DISTANCE', `${(game.distance / (PX_PER_METRE * 1000)).toFixed(2)} km`],
+      ['BEST', `${Math.max(game.bestScore, game.totalScore)}`],
+    ];
+    let y = H * 0.46;
+    ctx.font = '600 16px ui-monospace, Menlo, monospace';
+    if (game.totalScore >= game.bestScore && game.bestScore > 0) {
+      ctx.fillStyle = '#ffb040';
+      ctx.font = '700 20px Impact, "Arial Narrow", sans-serif';
+      ctx.fillText('NEW BEST', W / 2, y - 26);
+      ctx.font = '600 16px ui-monospace, Menlo, monospace';
+    }
+    for (const [k, v] of rows) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillText(k, W / 2 - 16, y);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#f2efe6';
+      ctx.fillText(v, W / 2 + 16, y);
+      y += 27;
+    }
+
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(this.frame * 0.06);
+    ctx.fillStyle = '#f2efe6';
+    ctx.font = '700 24px Impact, "Arial Narrow", sans-serif';
+    ctx.fillText('PRESS ENTER TO DRIVE AGAIN', W / 2, H * 0.88);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ==================================================================
+// js/main.js
+// ==================================================================
+
+// Boot and the main loop. Simulation runs on a fixed 60Hz step so physics is
+// identical regardless of display refresh rate; rendering runs once per frame.
+
+
+
+
+
+
+
+const STEP = 1 / 60;
+const MAX_CATCHUP = 5; // never simulate more than this many steps in one frame
+
+const canvas = document.getElementById('game');
+const sprites = makeSprites();
+const game = new Game((Math.random() * 0xffffffff) >>> 0);
+const renderer = new Renderer(canvas, sprites);
+const input = new Input();
+const audio = new GameAudio();
+
+const BEST_KEY = 'slickstreets.best';
+
+// Personal best is a per-browser convenience; never let storage break the game.
+try {
+  const saved = Number(window.localStorage.getItem(BEST_KEY));
+  if (Number.isFinite(saved)) game.bestScore = saved;
+} catch { /* private mode, or storage disabled */ }
+
+function saveBest() {
+  try { window.localStorage.setItem(BEST_KEY, String(game.bestScore)); } catch { /* ignore */ }
+}
+
+let paused = false;
+let accumulator = 0;
+let last = performance.now();
+
+window.addEventListener('resize', () => renderer.resize());
+canvas.addEventListener('pointerdown', () => {
+  audio.resume();
+  if (game.state !== 'playing') startRun();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) paused = true;
+});
+
+function startRun() {
+  const freshCity = game.state === 'dead';
+  game.start();
+  // A new run means a new city, so the old bloodstains have to go with it.
+  if (freshCity) renderer.reset();
+  paused = false;
+}
+
+function handleKeys() {
+  if (input.pressed('Enter', 'KeyR')) {
+    audio.resume();
+    if (game.state === 'playing' && input.down.has('KeyR')) {
+      // R during a run restarts immediately.
+      game.state = 'dead';
+    }
+    startRun();
+  }
+  if (input.pressed('KeyP', 'Escape')) {
+    if (game.state === 'playing') paused = !paused;
+  }
+  if (input.pressed('KeyM')) audio.toggleMute();
+
+  if (input.pressed('Space', 'ShiftLeft', 'ShiftRight')) {
+    audio.resume();
+    game.toggleGear();
+  }
+}
+
+function drainEvents() {
+  for (const ev of game.events) {
+    switch (ev.type) {
+      case 'kill':
+        if (ev.kind === ZOMBIE) audio.splat(ev.speed);
+        else audio.bone();
+        break;
+      case 'crash': audio.crash(ev.force); break;
+      case 'shift': audio.shift(); break;
+      case 'death':
+        audio.death();
+        if (game.totalScore > game.bestScore) {
+          game.bestScore = game.totalScore;
+          saveBest();
+        }
+        break;
+      default: break;
+    }
+  }
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!Number.isFinite(dt) || dt < 0) dt = 0;
+  dt = Math.min(dt, 0.25);
+
+  handleKeys();
+
+  if (!paused) {
+    audio.beginFrame();
+    accumulator += dt;
+    let steps = 0;
+    while (accumulator >= STEP && steps < MAX_CATCHUP) {
+      game.update(STEP, input.read());
+      drainEvents();
+      accumulator -= STEP;
+      steps++;
+    }
+    if (steps === MAX_CATCHUP) accumulator = 0; // gave up catching up; drop time
+
+    if (game.state === 'playing') {
+      audio.engine(game.car.rpm, game.car.gear === GEAR_LOW, game.crowd);
+    } else {
+      audio.idle();
+    }
+  } else {
+    audio.idle();
+  }
+
+  input.endFrame();
+  renderer.render(game, paused ? 0 : dt);
+  if (paused) renderer.drawPaused();
+}
+
+requestAnimationFrame(frame);
+
+// Handy for tinkering from the console.
+window.slick = { game, renderer, audio, input, GEAR_LOW, GEAR_HIGH };
+
+  // Keyboard input needs focus, which an embedded frame does not get for free.
+  // Scoped separately so these names cannot collide with the modules above.
+  function bootFocus() {
+    var hintEl = document.getElementById('hint');
+    var canvasEl = document.getElementById('game');
+    var dismiss = function () { if (hintEl) hintEl.classList.add('gone'); };
+    canvasEl.addEventListener('pointerdown', function () {
+      canvasEl.focus();
+      dismiss();
+    });
+    window.addEventListener('keydown', dismiss, { once: true });
+    window.addEventListener('load', function () { canvasEl.focus(); });
+    canvasEl.focus();
+  }
+  bootFocus();
+})();
+</script>

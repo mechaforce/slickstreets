@@ -1,0 +1,13 @@
+{
+  "name": "slick-streets",
+  "version": "1.0.0",
+  "description": "A top-down driving game about clearing a city of the undead the hard way.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'",
+    "build": "node tools/build-standalone.mjs",
+    "start": "python3 -m http.server 8000"
+  },
+  "license": "MIT"
+}
