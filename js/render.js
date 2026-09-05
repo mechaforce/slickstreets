@@ -6,6 +6,7 @@ import { ZOMBIE } from './enemies.js';
 import { MEAT, BONE } from './gore.js';
 import { MAX_HEALTH } from './game.js';
 import { PICKUP_KINDS, PICKUP_RADIUS, WIRE, WHEELS, FLAME } from './pickups.js';
+import { STICK_RADIUS } from './touch.js';
 import { clamp, lerp, TAU, mulberry32 } from './util.js';
 
 const ROAD_COLOR = '#26272d';
@@ -157,14 +158,19 @@ export class Renderer {
     this.dpr = dpr;
     this.w = w;
     this.h = h;
+    // The HUD is laid out in its own units and scaled down on small screens,
+    // so a phone gets the same furniture without it swallowing the view.
+    this.uiScale = clamp(Math.min(w / 1180, h / 700), 0.7, 1);
+    this.uw = w / this.uiScale;
+    this.uh = h / this.uiScale;
     this.gradients = null; // rebuilt lazily at the new size
   }
 
   _gradients() {
     if (this.gradients !== null) return this.gradients;
     const ctx = this.ctx;
-    const W = this.w;
-    const H = this.h;
+    const W = this.uw;
+    const H = this.uh;
     const vignette = ctx.createRadialGradient(
       W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
     vignette.addColorStop(0, 'rgba(0,0,0,0)');
@@ -246,7 +252,7 @@ export class Renderer {
     this.drawBuildings(game, view);
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(this.dpr, this.dpr);
+    ctx.scale(this.dpr * this.uiScale, this.dpr * this.uiScale);
     this.drawHud(game, dt);
   }
 
@@ -542,8 +548,8 @@ export class Renderer {
 
   drawHud(game, dt) {
     const ctx = this.ctx;
-    const W = this.w;
-    const H = this.h;
+    const W = this.uw;
+    const H = this.uh;
 
     for (const ev of game.events) {
       if (ev.type === 'hurt') this.hurtFlash = Math.min(1, this.hurtFlash + ev.amount * dt * 0.12);
@@ -575,6 +581,7 @@ export class Renderer {
     this.drawUpgrades(game);
     this.drawPickupToast(game);
     this.drawMinimap(game);
+    this.drawTouch(game);
 
     if (game.combo >= 3) {
       const pop = clamp(game.comboTimer / 1.4, 0, 1);
@@ -635,11 +642,18 @@ export class Renderer {
     ctx.fillText(`HORDE ${game.swarm.count}`, x, y);
   }
 
+  get touchOn() {
+    return this.touch !== undefined && this.touch !== null && this.touch.enabled;
+  }
+
   drawSpeedo(game, dt) {
     const ctx = this.ctx;
-    const cx = 96;
-    const cy = this.h - 96;
-    const r = 62;
+    // On touch the bottom corners belong to the thumbs, so the dial moves to
+    // the middle and drops the gear caption - the gear button says it instead.
+    const compact = this.touchOn;
+    const cx = compact ? this.uw / 2 : 96;
+    const cy = compact ? this.uh - 76 : this.uh - 96;
+    const r = compact ? 46 : 62;
     const car = game.car;
     const speed = Math.abs(car.speed);
     const maxAll = GEARS[GEAR_HIGH].maxSpeed;
@@ -680,14 +694,16 @@ export class Renderer {
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.fillText('KM/H', 0, 16);
 
-    // Gear.
+    // Gear. On touch this lives on the button under the right thumb.
     const low = car.gear === GEAR_LOW;
-    ctx.font = '700 22px Impact, "Arial Narrow", sans-serif';
-    ctx.fillStyle = low ? '#ffb040' : '#5ac8ff';
-    ctx.fillText(low ? 'LOW' : 'HIGH', 0, r + 4);
-    ctx.font = '600 9px ui-monospace, Menlo, monospace';
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.fillText('SHIFT · SPACE', 0, r + 18);
+    if (!compact) {
+      ctx.font = '700 22px Impact, "Arial Narrow", sans-serif';
+      ctx.fillStyle = low ? '#ffb040' : '#5ac8ff';
+      ctx.fillText(low ? 'LOW' : 'HIGH', 0, r + 4);
+      ctx.font = '600 9px ui-monospace, Menlo, monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.fillText('SHIFT · SPACE', 0, r + 18);
+    }
     ctx.restore();
 
     // Prompt when high gear is about to get you killed.
@@ -701,7 +717,7 @@ export class Renderer {
       ctx.textAlign = 'center';
       ctx.fillStyle = '#ffb040';
       ctx.font = '700 30px Impact, "Arial Narrow", sans-serif';
-      ctx.fillText('SHIFT DOWN', this.w / 2, this.h - 132);
+      ctx.fillText('SHIFT DOWN', this.uw / 2, this.uh - (this.touchOn ? 196 : 132));
       ctx.restore();
     }
   }
@@ -709,8 +725,8 @@ export class Renderer {
   drawPressure(game, dt) {
     const ctx = this.ctx;
     const w = 320;
-    const x = this.w / 2 - w / 2;
-    const y = this.h - 58;
+    const x = this.uw / 2 - w / 2;
+    const y = this.uh - (this.touchOn ? 152 : 58);
     const p = clamp(game.crowd, 0, 1);
 
     ctx.fillStyle = 'rgba(10,11,14,0.7)';
@@ -728,15 +744,16 @@ export class Renderer {
     ctx.textAlign = 'center';
     ctx.font = '600 11px ui-monospace, Menlo, monospace';
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText('SWARM PRESSURE', this.w / 2, y - 8);
+    ctx.fillText('SWARM PRESSURE', this.uw / 2, y - 8);
   }
 
   /** Chips in the top-right for whatever is currently bolted to the car. */
   drawUpgrades(game) {
     const ctx = this.ctx;
     const w = 186;
-    const x = this.w - w - 22;
-    let y = 24;
+    const x = this.uw - w - 22;
+    // Under the minimap when touch has moved it up into the corner.
+    let y = this.touchOn ? 160 : 24;
 
     for (let kind = 0; kind < PICKUP_KINDS.length; kind++) {
       const left = game.power[kind];
@@ -779,6 +796,86 @@ export class Renderer {
     }
   }
 
+  /** The joystick and the gear button, drawn only when touch is in use. */
+  drawTouch(game) {
+    if (!this.touchOn) return;
+    const ctx = this.ctx;
+    const t = this.touch;
+    const st = t.stick;
+    const low = game.car.gear === GEAR_LOW;
+    const gearColour = low ? '#ffb040' : '#5ac8ff';
+
+    // Joystick: dimmed at rest, lit while your thumb is on it.
+    const live = st.down;
+    ctx.save();
+    ctx.globalAlpha = live ? 0.9 : 0.4;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(242,239,230,0.5)';
+    ctx.fillStyle = 'rgba(8,9,12,0.42)';
+    ctx.beginPath();
+    ctx.arc(st.baseX, st.baseY, STICK_RADIUS, 0, TAU);
+    ctx.fill();
+    ctx.stroke();
+
+    // Direction ticks, so the ring reads as a control and not a decoration.
+    ctx.strokeStyle = 'rgba(242,239,230,0.28)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * TAU;
+      ctx.beginPath();
+      ctx.moveTo(st.baseX + Math.cos(a) * (STICK_RADIUS - 12), st.baseY + Math.sin(a) * (STICK_RADIUS - 12));
+      ctx.lineTo(st.baseX + Math.cos(a) * (STICK_RADIUS - 3), st.baseY + Math.sin(a) * (STICK_RADIUS - 3));
+      ctx.stroke();
+    }
+
+    const kx = st.baseX + st.dx;
+    const ky = st.baseY + st.dy;
+    ctx.fillStyle = live ? 'rgba(232,69,47,0.92)' : 'rgba(242,239,230,0.34)';
+    ctx.beginPath();
+    ctx.arc(kx, ky, 30, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+
+    // Gear button.
+    const g = t.gear;
+    ctx.save();
+    ctx.globalAlpha = g.down ? 1 : 0.86;
+    ctx.fillStyle = 'rgba(8,9,12,0.66)';
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, g.r, 0, TAU);
+    ctx.fill();
+    ctx.lineWidth = g.down ? 5 : 3;
+    ctx.strokeStyle = gearColour;
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = gearColour;
+    ctx.font = '700 26px Impact, "Arial Narrow", sans-serif';
+    ctx.fillText(low ? 'LOW' : 'HIGH', g.x, g.y + 4);
+    ctx.font = '600 9px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    ctx.fillText('GEAR', g.x, g.y + 20);
+    ctx.restore();
+
+    // Pause.
+    const pb = t.pause;
+    ctx.save();
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = 'rgba(8,9,12,0.66)';
+    ctx.beginPath();
+    ctx.arc(pb.x, pb.y, pb.r, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(242,239,230,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(242,239,230,0.85)';
+    ctx.fillRect(pb.x - 6, pb.y - 7, 4, 14);
+    ctx.fillRect(pb.x + 2, pb.y - 7, 4, 14);
+    ctx.restore();
+  }
+
   /** Big confirmation of what you just drove over. */
   drawPickupToast(game) {
     if (game.lastPickup < 0 || game.lastPickupAge > 2.2) return;
@@ -793,19 +890,20 @@ export class Renderer {
     ctx.textAlign = 'center';
     ctx.fillStyle = def.colour;
     ctx.font = `700 ${34 + (1 - rise) * 16}px Impact, "Arial Narrow", sans-serif`;
-    ctx.fillText(def.name, this.w / 2, this.h * 0.26);
+    ctx.fillText(def.name, this.uw / 2, this.uh * 0.26);
     ctx.font = '600 13px ui-monospace, Menlo, monospace';
     ctx.fillStyle = 'rgba(255,255,255,0.7)';
-    ctx.fillText(def.blurb, this.w / 2, this.h * 0.26 + 22);
+    ctx.fillText(def.blurb, this.uw / 2, this.uh * 0.26 + 22);
     ctx.restore();
   }
 
   drawMinimap(game) {
     const ctx = this.ctx;
-    const size = 168;
-    const pad = 22;
-    const x = this.w - size - pad;
-    const y = this.h - size - pad;
+    const touch = this.touchOn;
+    const size = touch ? 124 : 168;
+    const pad = touch ? 18 : 22;
+    const x = this.uw - size - pad;
+    const y = touch ? pad : this.uh - size - pad;
     const range = 2100;
     const s = size / (range * 2);
     const car = game.car;
@@ -874,22 +972,22 @@ export class Renderer {
   drawPaused() {
     const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(this.dpr, this.dpr);
+    ctx.scale(this.dpr * this.uiScale, this.dpr * this.uiScale);
     ctx.fillStyle = 'rgba(6,7,10,0.6)';
-    ctx.fillRect(0, 0, this.w, this.h);
+    ctx.fillRect(0, 0, this.uw, this.uh);
     ctx.textAlign = 'center';
     ctx.fillStyle = '#f2efe6';
     ctx.font = '700 64px Impact, "Arial Narrow", sans-serif';
-    ctx.fillText('PAUSED', this.w / 2, this.h / 2);
+    ctx.fillText('PAUSED', this.uw / 2, this.uh / 2);
     ctx.font = '600 14px ui-monospace, Menlo, monospace';
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText('press P to keep driving', this.w / 2, this.h / 2 + 30);
+    ctx.fillText(this.touchOn ? 'tap to keep driving' : 'press P to keep driving', this.uw / 2, this.uh / 2 + 30);
   }
 
   drawTitle(game) {
     const ctx = this.ctx;
-    const W = this.w;
-    const H = this.h;
+    const W = this.uw;
+    const H = this.uh;
     ctx.fillStyle = 'rgba(6,7,10,0.62)';
     ctx.fillRect(0, 0, W, H);
     ctx.textAlign = 'center';
@@ -902,7 +1000,14 @@ export class Renderer {
     ctx.font = '600 15px ui-monospace, Menlo, monospace';
     ctx.fillText('the city is full. clear a path.', W / 2, H * 0.32 + 34);
 
-    const lines = [
+    const lines = this.touchOn ? [
+      ['JOYSTICK', 'push where you want to go'],
+      ['PULL BACK', 'brake, then reverse'],
+      ['GEAR BUTTON', 'change gear'],
+      ['LOW gear', 'torque — claws you out of a swarm'],
+      ['HIGH gear', 'top speed — but it bogs down in a crowd'],
+      ['CRATES', 'drive over them for upgrades'],
+    ] : [
       ['W / ↑', 'throttle'],
       ['S / ↓', 'brake · reverse'],
       ['A D / ← →', 'steer'],
@@ -942,14 +1047,14 @@ export class Renderer {
     ctx.globalAlpha = 0.6 + 0.4 * Math.sin(this.frame * 0.06);
     ctx.fillStyle = '#f2efe6';
     ctx.font = '700 26px Impact, "Arial Narrow", sans-serif';
-    ctx.fillText('PRESS ENTER TO DRIVE', W / 2, H * 0.86);
+    ctx.fillText(this.touchOn ? 'TAP TO DRIVE' : 'PRESS ENTER TO DRIVE', W / 2, H * 0.86);
     ctx.globalAlpha = 1;
   }
 
   drawGameOver(game) {
     const ctx = this.ctx;
-    const W = this.w;
-    const H = this.h;
+    const W = this.uw;
+    const H = this.uh;
     ctx.fillStyle = 'rgba(30,4,4,0.66)';
     ctx.fillRect(0, 0, W, H);
     ctx.textAlign = 'center';
@@ -994,7 +1099,7 @@ export class Renderer {
     ctx.globalAlpha = 0.6 + 0.4 * Math.sin(this.frame * 0.06);
     ctx.fillStyle = '#f2efe6';
     ctx.font = '700 24px Impact, "Arial Narrow", sans-serif';
-    ctx.fillText('PRESS ENTER TO DRIVE AGAIN', W / 2, H * 0.88);
+    ctx.fillText(this.touchOn ? 'TAP TO DRIVE AGAIN' : 'PRESS ENTER TO DRIVE AGAIN', W / 2, H * 0.88);
     ctx.globalAlpha = 1;
   }
 }

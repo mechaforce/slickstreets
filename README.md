@@ -46,6 +46,28 @@ away, so the map never runs dry and there is always somewhere to be going.
 
 ## Controls
 
+### Touch
+
+The controls appear by themselves on anything with a touchscreen, and hide
+again the moment you touch a key.
+
+- **Joystick, anywhere in the lower third.** It plants itself wherever your
+  thumb lands rather than sitting in a fixed spot you have to find. Push where
+  you want the car to go and it steers itself there; how far you push is how
+  much throttle. Pull back to brake, and keep pulling to reverse — once you are
+  actually rolling backwards the steering mirrors, so the tail follows the
+  stick.
+- **Gear button, bottom right.** Shows the gear you are in, in that gear's
+  colour. Tap to change.
+- **Pause, top centre.**
+
+On a touchscreen the HUD rearranges around your thumbs: the minimap moves to
+the top right and the speedometer to the bottom centre, so both bottom corners
+are free. Everything scales down on a small screen without shrinking the
+buttons below a comfortable target.
+
+### Keyboard
+
 | Key | |
 |---|---|
 | `W` / `↑` | throttle |
@@ -93,6 +115,11 @@ something the bare car misses while the car itself stays the same size, and
 that the flamethrower burns a cone off the nose — and nothing behind it,
 beside it, or out of range — on a 3-5 second cadence.
 
+The joystick's mapping from stick deflection to throttle and steering is a
+pure function too, so the tests cover the deadzone, proportional steering,
+braking, the mirrored steering while reversing, and that holding the stick in
+a direction really does bring the car round to that heading.
+
 ## Layout
 
 ```
@@ -108,6 +135,7 @@ js/
   sprites.js       every sprite drawn once into an offscreen canvas
   render.js        camera, pseudo-3D city, decal-baked blood, HUD
   input.js         keyboard
+  touch.js         joystick and buttons, with a pure stick-to-controls map
   audio.js         procedural sound, no asset files
   main.js          boot and the fixed-timestep loop
 tools/

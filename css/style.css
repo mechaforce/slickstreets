@@ -27,6 +27,12 @@ html, body {
   height: 100vh;
   cursor: crosshair;
   image-rendering: auto;
+  /* The canvas handles every gesture itself: no scrolling, no pinch zoom,
+     no long-press callout, no blue flash under a thumb. */
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  outline: none;
 }
 
 .notice {

@@ -5,6 +5,7 @@ import { Game } from './game.js';
 import { Renderer } from './render.js';
 import { Input } from './input.js';
 import { GameAudio } from './audio.js';
+import { TouchControls } from './touch.js';
 import { makeSprites } from './sprites.js';
 import { GEAR_LOW, GEAR_HIGH } from './car.js';
 import { ZOMBIE } from './enemies.js';
@@ -18,6 +19,8 @@ const game = new Game((Math.random() * 0xffffffff) >>> 0);
 const renderer = new Renderer(canvas, sprites);
 const input = new Input();
 const audio = new GameAudio();
+const touch = new TouchControls(canvas);
+renderer.touch = touch;
 
 const BEST_KEY = 'slickstreets.best';
 
@@ -40,6 +43,10 @@ canvas.addEventListener('pointerdown', () => {
   audio.resume();
   if (game.state !== 'playing') startRun();
 });
+// Keys mean a keyboard is present, so put the touch furniture away.
+window.addEventListener('keydown', () => {
+  if (touch.enabled && !touch.stick.down) touch.enabled = false;
+}, { once: true });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) paused = true;
 });
@@ -50,6 +57,26 @@ function startRun() {
   // A new run means a new city, so the old bloodstains have to go with it.
   if (freshCity) renderer.reset();
   paused = false;
+}
+
+function handleTouch() {
+  touch.layout(renderer.uw, renderer.uh, renderer.uiScale);
+  const taps = touch.consumeTaps();
+  if (taps.gear) {
+    audio.resume();
+    if (game.state === 'playing') game.toggleGear();
+  }
+  // One toggle: the run stays in the 'playing' state while paused.
+  if (taps.pause && game.state === 'playing') paused = !paused;
+  return taps;
+}
+
+/** Keyboard and stick both feed the car; whichever is being used wins. */
+function readInput() {
+  const keys = input.read();
+  if (keys.throttle !== 0 || keys.steer !== 0) return keys;
+  const stick = touch.read(game.car);
+  return stick.active ? { throttle: stick.throttle, steer: stick.steer } : keys;
 }
 
 function handleKeys() {
@@ -106,13 +133,14 @@ function frame(now) {
   dt = Math.min(dt, 0.25);
 
   handleKeys();
+  handleTouch();
 
   if (!paused) {
     audio.beginFrame();
     accumulator += dt;
     let steps = 0;
     while (accumulator >= STEP && steps < MAX_CATCHUP) {
-      game.update(STEP, input.read());
+      game.update(STEP, readInput());
       drainEvents();
       accumulator -= STEP;
       steps++;
@@ -136,4 +164,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for tinkering from the console.
-window.slick = { game, renderer, audio, input, GEAR_LOW, GEAR_HIGH };
+window.slick = { game, renderer, audio, input, touch, GEAR_LOW, GEAR_HIGH };

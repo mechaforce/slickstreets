@@ -8,6 +8,7 @@ import { ZOMBIE, SKELETON, KINDS } from '../js/enemies.js';
 import { createBot, botInput } from './bot.mjs';
 import { PickupField, PICKUP_KINDS, WIRE, WHEELS, FLAME } from '../js/pickups.js';
 import { CAR_WIDTH } from '../js/car.js';
+import { stickToInput, STICK_RADIUS } from '../js/touch.js';
 
 const STEP = 1 / 60;
 
@@ -370,4 +371,65 @@ test('upgrades: an armed car clears a swarm that would otherwise stop it', () =>
   const armed = survive(true);
   assert.ok(armed.kills > bare.kills * 1.5,
     `upgrades should clear far more (${armed.kills} vs ${bare.kills})`);
+});
+
+// ---------------------------------------------------------------------------
+// Touch controls
+// ---------------------------------------------------------------------------
+
+test('joystick: a centred stick asks for nothing', () => {
+  const r = stickToInput(0, 0, 0.05, 0.05);
+  assert.equal(r.active, false);
+  assert.equal(r.throttle, 0);
+  assert.equal(r.steer, 0);
+});
+
+test('joystick: push where you want to go and the car steers there', () => {
+  // Car pointing east (+x). Stick east: straight on, no steering.
+  const ahead = stickToInput(0, 200, 1, 0);
+  assert.ok(ahead.throttle > 0.9, 'full deflection is full throttle');
+  assert.ok(Math.abs(ahead.steer) < 0.05, 'no steering needed');
+
+  // Stick south (+y on screen) is a right turn for an eastbound car.
+  const right = stickToInput(0, 200, 0, 1);
+  assert.ok(right.steer > 0.9, 'steers right');
+  const left = stickToInput(0, 200, 0, -1);
+  assert.ok(left.steer < -0.9, 'steers left');
+
+  // Steering is proportional near the middle, not just on/off.
+  const slight = stickToInput(0, 200, 1, 0.2);
+  assert.ok(slight.steer > 0.05 && slight.steer < right.steer, 'a gentle push is a gentle turn');
+});
+
+test('joystick: pulling back brakes, then reverses', () => {
+  // Rolling forwards: pull back and it asks for the brakes.
+  const braking = stickToInput(0, 260, -1, 0);
+  assert.ok(braking.throttle < 0, 'negative throttle is the brake');
+
+  // Actually reversing now: steering mirrors so the tail follows the stick.
+  const backLeft = stickToInput(0, -40, -1, -0.4);
+  const backRight = stickToInput(0, -40, -1, 0.4);
+  assert.ok(Math.sign(backLeft.steer) !== Math.sign(backRight.steer),
+    'the two directions must not both steer the same way');
+});
+
+test('joystick: partial deflection gives partial throttle', () => {
+  const half = stickToInput(0, 0, 0.5, 0);
+  const full = stickToInput(0, 0, 1, 0);
+  assert.ok(half.throttle > 0 && half.throttle < full.throttle * 0.75,
+    `expected a lighter throttle, got ${half.throttle.toFixed(2)} vs ${full.throttle.toFixed(2)}`);
+});
+
+test('joystick: it can actually drive the car', () => {
+  const g = new Game(23);
+  g.start();
+  g.car.ang = 0;
+  // Hold the stick due south and the car should come round to face that way.
+  for (let i = 0; i < 60 * 4; i++) {
+    const r = stickToInput(g.car.ang, g.car.speed, 0, 1);
+    g.update(STEP, { throttle: r.throttle, steer: r.steer });
+  }
+  assert.ok(Math.abs(g.car.ang - Math.PI / 2) < 0.3,
+    `car should be heading south, is at ${(g.car.ang * 57.3).toFixed(0)} degrees`);
+  assert.ok(g.car.speed > 100, 'and moving');
 });

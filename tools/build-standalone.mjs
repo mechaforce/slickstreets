@@ -19,6 +19,7 @@ const ORDER = [
   'spatialhash.js',
   'city.js',
   'pickups.js',
+  'touch.js',
   'car.js',
   'enemies.js',
   'gore.js',
@@ -128,6 +129,13 @@ ${body}
     var hintEl = document.getElementById('hint');
     var canvasEl = document.getElementById('game');
     var dismiss = function () { if (hintEl) hintEl.classList.add('gone'); };
+    // A phone needs different words, and no instruction to click.
+    try {
+      if (hintEl && window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
+        hintEl.textContent = 'TAP TO DRIVE';
+      }
+    } catch (err) { /* leave the default wording */ }
+    canvasEl.addEventListener('touchstart', dismiss, { passive: true });
     canvasEl.addEventListener('pointerdown', function () {
       canvasEl.focus();
       dismiss();
