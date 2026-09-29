@@ -31,6 +31,8 @@ export const GEARS = [
 export const REVERSE_SPEED = 130;
 /** Acceleration applied per unit of crowd pressure (pressure 1 = fully mobbed). */
 export const CROWD_DRAG = 640;
+/** Grip lost on a road slick with blood, at full depth. */
+export const TRACTION_LOSS = 0.58;
 
 export function createCar(x, y, ang = 0) {
   return {
@@ -41,6 +43,8 @@ export function createCar(x, y, ang = 0) {
     rpm: 0,          // 0..1, for the engine note and the tacho
     steer: 0,        // smoothed steering input
     lastImpact: 0,   // speed lost to the most recent wall hit
+    wheelspin: 0,    // 0..1, how much the tyres are losing to the road
+    tyreBlood: 0,    // 0..1, how much blood the tyres are carrying
   };
 }
 
@@ -63,13 +67,15 @@ export function torqueAt(gear, speed) {
 
 /**
  * Advance the car one step.
- *   input: { throttle: -1..1, steer: -1..1 }
- *   env:   { crowd: 0..1+ swarm pressure, gore: 0..1 gore drag }
+ *   input: { throttle: -1..1, steer: -1..1, burnout: bool }
+ *   env:   { crowd: swarm pressure, gore: gore drag, slip: 0..1 blood depth }
  */
 export function updateCar(car, input, dt, env) {
   const g = GEARS[car.gear];
   const crowd = env && env.crowd ? env.crowd : 0;
   const gore = env && env.gore ? env.gore : 0;
+  const slip = env && env.slip ? clamp(env.slip, 0, 1) : 0;
+  const burnout = !!(input && input.burnout);
 
   const cos = Math.cos(car.ang);
   const sin = Math.sin(car.ang);
@@ -81,10 +87,26 @@ export function updateCar(car, input, dt, env) {
   const throttle = clamp(input.throttle || 0, -1, 1);
 
   let accel = 0;
-  if (throttle > 0) {
+  let spin = 0;
+  if (burnout) {
+    // Throttle and brake together: the brakes hold the car while the engine
+    // lights the tyres up. Barely moves, spins like mad, and on a wet road
+    // throws a great deal of blood about.
+    spin = 1;
+    accel = (45 - fwd) * 6;
+  } else if (throttle > 0) {
     const torque = torqueAt(car.gear, Math.max(0, fwd));
     const headroom = 1 - Math.pow(clamp(fwd / g.maxSpeed, 0, 1), 1.6);
-    accel = g.force * torque * headroom * throttle;
+    const demand = g.force * torque * headroom * throttle;
+    // What the tyres can actually put down. Blood costs you most of it, and
+    // low gear has the torque to break traction where high gear does not.
+    const hold = g.force * (1 - TRACTION_LOSS * slip);
+    if (demand > hold) {
+      spin = clamp((demand - hold) / g.force, 0, 1);
+      accel = hold;
+    } else {
+      accel = demand;
+    }
   } else if (throttle < 0) {
     // Brake hard while rolling forward, then creep backwards.
     accel = fwd > 12 ? -1500 * -throttle : -520 * -throttle;
@@ -101,25 +123,42 @@ export function updateCar(car, input, dt, env) {
   if (fwd < -REVERSE_SPEED) fwd = -REVERSE_SPEED;
   if (Math.abs(fwd) < 1.5 && throttle === 0) fwd = 0;
 
-  // Tyres scrub off sideways velocity; less grip when the crowd is shoving.
-  lat -= lat * Math.min(1, g.grip * dt * (1 - 0.35 * clamp(crowd, 0, 1)));
+  car.wheelspin += (spin - car.wheelspin) * Math.min(1, dt * 9);
+
+  // Tyres scrub off sideways velocity; less grip when the crowd is shoving,
+  // and much less on blood or with the wheels already spinning.
+  const gripLoss = clamp(0.55 * slip + 0.45 * car.wheelspin, 0, 0.82);
+  lat -= lat * Math.min(1, g.grip * (1 - gripLoss) * dt * (1 - 0.35 * clamp(crowd, 0, 1)));
 
   // Steering authority falls away at very low and very high speed.
   const target = clamp(input.steer || 0, -1, 1);
   car.steer += (target - car.steer) * Math.min(1, dt * 12);
-  const gripSpeed = clamp(Math.abs(fwd) / 90, 0, 1);
+  // Steering needs some speed to bite - except in a burnout, where the point
+  // is to be able to swing the car round on the spot.
+  const gripSpeed = Math.max(clamp(Math.abs(fwd) / 90, 0, 1), burnout ? 0.9 : 0);
   const fast = 1 - 0.45 * clamp(Math.abs(fwd) / g.maxSpeed, 0, 1);
-  car.ang += car.steer * g.turn * gripSpeed * fast * sign(fwd || 1) * dt;
+  const dAng = car.steer * g.turn * gripSpeed * fast * sign(fwd || 1) * dt;
+  car.ang += dAng;
   if (car.ang > Math.PI) car.ang -= TAU;
   if (car.ang < -Math.PI) car.ang += TAU;
 
-  const c2 = Math.cos(car.ang);
-  const s2 = Math.sin(car.ang);
-  car.vx = fwd * c2 - lat * s2;
-  car.vy = fwd * s2 + lat * c2;
+  // Put the velocity back into world space in the heading we started with...
+  const wvx = fwd * cos - lat * sin;
+  const wvy = fwd * sin + lat * cos;
+
+  // ...then swing the momentum round after the nose only as far as the tyres
+  // can drag it. With full grip it follows exactly and the car goes where it
+  // points; on blood the nose comes round while the car keeps sliding the way
+  // it was already going, which is what makes a slick road feel slick.
+  const rot = dAng * (1 - gripLoss);
+  const cr = Math.cos(rot);
+  const sr = Math.sin(rot);
+  car.vx = wvx * cr - wvy * sr;
+  car.vy = wvx * sr + wvy * cr;
+
   car.x += car.vx * dt;
   car.y += car.vy * dt;
-  car.speed = fwd;
+  car.speed = car.vx * Math.cos(car.ang) + car.vy * Math.sin(car.ang);
 
   const targetRpm = clamp(Math.abs(fwd) / g.maxSpeed, 0, 1) * 0.8 + (throttle > 0 ? 0.2 : 0.05);
   car.rpm += (targetRpm - car.rpm) * Math.min(1, dt * 6);

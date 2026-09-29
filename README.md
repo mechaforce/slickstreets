@@ -27,6 +27,16 @@ out of that:
   objects. Drive through a pile and you shove it aside, which leaves a cleared
   channel through the mess — the trail you carved is visible behind you, and it
   is the map of where you have already been.
+- **And the blood is wet.** What comes out of them is simulated as a fluid: it
+  pools, it flows, it gets dragged along by your tyres and thrown by a spinning
+  wheel. It is also *slippery*. Kill enough of them in one place and the road
+  stops gripping — the nose comes round while the car keeps going the way it
+  was already going. Your tyres pick the blood up and trail it away behind you
+  until they run clean.
+- **Burnouts.** Throttle and brake together (`W`+`S`, or hold the gear button
+  on touch) holds the car on the brakes and lights the tyres up. In a pool of
+  blood that throws a rooster tail of it across the street and paints the road
+  where you sat.
 
 Zombies are slow, heavy and clog the car. Skeletons are quick and brittle: they
 die at lower speed but they reach you first and claw harder.
@@ -120,6 +130,14 @@ pure function too, so the tests cover the deadzone, proportional steering,
 braking, the mirrored steering while reversing, and that holding the stick in
 a direction really does bring the car round to that heading.
 
+The blood gets the same treatment: that the fluid carries blood the way it is
+pushed and not evenly in all directions, that a clean road is free and a pool
+dries up, that only the bloody part of the grid is woken, that the scrolling
+window keeps blood at the world position it was spilt at, that a slick road
+makes the car slide where a dry one does not, that low gear can break traction
+on blood where high gear cannot, and that a burnout spins the car on the spot
+while throwing blood and laying rubber.
+
 ## Layout
 
 ```
@@ -130,6 +148,7 @@ js/
   car.js           pure arcade physics and the gearbox
   enemies.js       the horde: pooling, steering, separation, spawning
   gore.js          pushable chunks
+  fluid.js         the wet blood: a small stable-fluid solver
   pickups.js       upgrade crates scattered over the map
   game.js          owns the world, steps it, emits events
   sprites.js       every sprite drawn once into an offscreen canvas
@@ -148,6 +167,28 @@ test/
 `game.js` and everything it imports never touch the DOM. The renderer reads the
 simulation; the simulation never calls the renderer. That split is what makes
 the tests above possible.
+
+## The blood
+
+There are two separate layers of it, doing different jobs.
+
+**Wet blood** is a light 2D fluid — semi-Lagrangian advection with a few
+Gauss-Seidel pressure iterations, in the style of Stam's stable fluids. It runs
+on a 128×128 grid that scrolls with the car, covering about 2300px of city, at
+half the simulation rate. The pressure solve is what gives a smear its swirl
+rather than making it a blur. This layer is the one the car interacts with: the
+tyres drag it, pick it up and throw it, and its depth under the car is what
+decides how much grip you have.
+
+Cost is kept off the clock by only simulating the part of the grid that has
+blood in it: a clean road costs nothing measurable, a normal trail about 0.1ms
+per step, and the worst case — the whole window slick — about 2ms at 30Hz.
+
+**Dried blood** is the permanent record, baked into half-resolution decal
+tiles: splatter where they burst, and tyre marks laid at a fixed spacing along
+the ground while your tyres are still carrying blood. Wet blood that scrolls
+out of the fluid window is already written there, so the trail survives even
+though the simulation has long since forgotten it.
 
 ## Performance notes
 

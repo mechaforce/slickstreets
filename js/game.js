@@ -4,11 +4,13 @@
 import { generateCity, resolveCircle, isBlocked } from './city.js';
 import {
   createCar, updateCar, applyImpact, overlapsCar, bodyCircle,
-  BODY_RADIUS, GEAR_LOW, GEAR_HIGH, GEARS, toggleGear, CAR_LENGTH, PX_PER_METRE,
+  BODY_RADIUS, GEAR_LOW, GEAR_HIGH, GEARS, toggleGear, CAR_LENGTH, CAR_WIDTH,
+  PX_PER_METRE,
 } from './car.js';
 import { Swarm, KINDS, ZOMBIE, SKELETON } from './enemies.js';
 import { GoreField, MEAT, BONE, CHAR } from './gore.js';
 import { PickupField, PICKUP_KINDS, WIRE, WHEELS, FLAME } from './pickups.js';
+import { BloodField } from './fluid.js';
 import { clamp, rr, mulberry32, TAU } from './util.js';
 
 export const MAX_HEALTH = 100;
@@ -20,7 +22,7 @@ const REGEN_RATE = 3.0;
 const COMBO_WINDOW = 1.4;
 const RAMP_SECONDS = 260;   // time to reach maximum horde density
 
-const MAX_PARTICLES = 900;
+const MAX_PARTICLES = 1400;
 
 /** Chance per second that any one enemy touching the wire is shredded by it. */
 const WIRE_SHRED_RATE = 0.9;
@@ -33,6 +35,19 @@ const FLAME_GAP = [3, 5];
 const FLAME_SPRAY = 0.6;
 const FLAME_RANGE = 205;
 const FLAME_HALF_ANGLE = 0.44;
+
+/** How much wet blood each kind of kill pours onto the road. */
+const BLOOD_PER_KILL = [0.3, 0.1, 0];   // meat, bone, charred
+/** Wet blood depth that counts as a fully slick road. */
+const SLIP_SCALE = 1.25;
+/** Distance between tyre marks laid down while the tyres are bloody. */
+const TRACK_SPACING = 9;
+/**
+ * The renderer bakes these and clears them. Cap them so a headless run - or a
+ * frame where the simulation steps several times before one draw - cannot let
+ * them grow without bound.
+ */
+const MAX_PENDING_MARKS = 512;
 
 export class Game {
   constructor(seed = Date.now()) {
@@ -57,6 +72,7 @@ export class Game {
     this.swarm = new Swarm(this.city, this.seed);
     this.gore = new GoreField(this.seed);
     this.pickups = new PickupField(this.city, this.seed);
+    this.blood = new BloodField();
 
     // Start on an intersection near the middle of the map.
     const c = this.city.cell;
@@ -64,6 +80,7 @@ export class Game {
     const gy = Math.floor(this.city.rows / 2) * c;
     this.car = createCar(gx, gy, -Math.PI / 2);
     this.car.gear = GEAR_HIGH;
+    this.blood.anchor(gx, gy);
 
     this.state = 'title';
     this.time = 0;
@@ -91,6 +108,11 @@ export class Game {
     this.shredKills = 0;
     this.burnKills = 0;
     this._collected = [];
+    this.slip = 0;
+    this.trackDist = 0;
+    this.fluidTick = 0;
+    /** Tyre marks waiting to be baked into the permanent stains. */
+    this.marks = [];
     for (const p of this.particles) p.live = false;
     this.events.length = 0;
     this._seedAttractHorde();
@@ -120,6 +142,8 @@ export class Game {
     // every run starts with room to get moving rather than already buried.
     this.swarm.reset();
     this.gore.reset();
+    this.blood.reset();
+    this.marks.length = 0;
     this.state = 'playing';
     this.events.push({ type: 'start' });
   }
@@ -161,6 +185,11 @@ export class Game {
   killEnemy(e, dirx, diry, power, goreKind, amount) {
     const k = KINDS[e.kind];
     this.gore.burst(e.x, e.y, dirx, diry, power, goreKind, amount);
+    const wet = BLOOD_PER_KILL[goreKind];
+    if (wet > 0) {
+      // Thrown along the direction of the hit, so it sprays rather than pools.
+      this.blood.add(e.x, e.y, wet, dirx * power * 0.45, diry * power * 0.45, 24);
+    }
     this.swarm.kill(e);
     this.kills++;
     if (e.kind === ZOMBIE) this.zombieKills++; else this.skeletonKills++;
@@ -169,6 +198,92 @@ export class Game {
     if (this.combo > this.bestCombo) this.bestCombo = this.combo;
     this.score += Math.round(10 * (1 + Math.min(this.combo, 40) * 0.05));
     return k;
+  }
+
+  /**
+   * Everything the tyres do to the wet blood: drag it about, pick it up, and
+   * lay it back down as tracks. This is what carves a legible path through a
+   * pool and what a burnout throws everywhere.
+   */
+  tyres(dt) {
+    const car = this.car;
+    const blood = this.blood;
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+    const speed = Math.hypot(car.vx, car.vy);
+    const spin = car.wheelspin;
+    const wet = this.slip;
+    const halfW = CAR_WIDTH * 0.5;
+
+    // Front and rear, left and right.
+    const wheels = [
+      [CAR_LENGTH * 0.30, -halfW], [CAR_LENGTH * 0.30, halfW],
+      [-CAR_LENGTH * 0.30, -halfW], [-CAR_LENGTH * 0.30, halfW],
+    ];
+
+    let picked = 0;
+    for (let i = 0; i < wheels.length; i++) {
+      const [lx, ly] = wheels[i];
+      const wx = car.x + cos * lx - sin * ly;
+      const wy = car.y + sin * lx + cos * ly;
+      const rear = i >= 2;
+
+      if (wet > 0.01) {
+        // Drag whatever the tyre is standing in along with the car.
+        if (speed > 18) blood.addVelocity(wx, wy, car.vx * 0.5, car.vy * 0.5, 14);
+        picked += blood.take(wx, wy, 0.16 + spin * 0.3, 13);
+      }
+
+      // A spinning rear wheel throws blood backwards in a rooster tail.
+      if (rear && spin > 0.2) {
+        const throwSpeed = 120 + spin * 520;
+        const jitter = rr(this.rng, -0.5, 0.5);
+        const a = car.ang + Math.PI + jitter;
+        blood.addVelocity(wx, wy, Math.cos(a) * throwSpeed, Math.sin(a) * throwSpeed, 17);
+
+        if (wet > 0.04) {
+          for (let s = 0; s < 2; s++) {
+            const pa = car.ang + Math.PI + rr(this.rng, -0.7, 0.7);
+            const sp = rr(this.rng, 90, 380) * spin;
+            this.emitParticle(wx, wy, Math.cos(pa) * sp + car.vx, Math.sin(pa) * sp + car.vy,
+              rr(this.rng, 0.3, 0.75), rr(this.rng, 2, 5), 0, this.rng());
+          }
+        }
+        // Tyre smoke, blood or no blood.
+        if (this.rng() < 0.7) {
+          this.emitParticle(wx, wy, rr(this.rng, -50, 50) + car.vx * 0.3,
+            rr(this.rng, -50, 50) + car.vy * 0.3,
+            rr(this.rng, 0.5, 1.2), rr(this.rng, 5, 11), 4, this.rng());
+        }
+      }
+    }
+
+    car.tyreBlood = clamp(car.tyreBlood + picked * 2.6 - dt * 0.28, 0, 1);
+
+    // Lay tracks at a fixed spacing along the ground, not per frame, so they
+    // do not bunch up when slow or leave gaps when quick.
+    this.trackDist += speed * dt;
+    const laying = car.tyreBlood > 0.02 || spin > 0.25;
+    if (laying && (this.trackDist >= TRACK_SPACING || spin > 0.25)) {
+      this.trackDist = 0;
+      const strength = clamp(car.tyreBlood * 0.9 + spin * 0.5, 0.08, 1);
+      for (let i = 2; i < 4; i++) {
+        const [lx, ly] = wheels[i];
+        this.marks.push({
+          x: car.x + cos * lx - sin * ly,
+          y: car.y + sin * lx + cos * ly,
+          ang: car.ang,
+          w: 15 + spin * 12,
+          h: 8 + spin * 5,
+          a: strength * (0.3 + spin * 0.45),
+          blood: clamp(car.tyreBlood * 1.3 + wet, 0, 1),
+        });
+      }
+      car.tyreBlood = Math.max(0, car.tyreBlood - 0.035);
+      if (this.marks.length > MAX_PENDING_MARKS) {
+        this.marks.splice(0, this.marks.length - MAX_PENDING_MARKS);
+      }
+    }
   }
 
   /** The flamethrower's cone, swept every frame while it is spraying. */
@@ -190,7 +305,7 @@ export class Game {
       if (d > FLAME_RANGE) continue;
       // Inside the cone? Everything close to the muzzle counts.
       if (d > 26 && (dx * cos + dy * sin) / d < Math.cos(FLAME_HALF_ANGLE)) continue;
-      this.killEnemy(e, dx / (d || 1), dy / (d || 1), 120, CHAR, 3);
+      this.killEnemy(e, dx / (d || 1), dy / (d || 1), 120, CHAR, 5);
       this.burnKills++;
       this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed: 0, burned: true });
       for (let s2 = 0; s2 < 3; s2++) {
@@ -226,6 +341,8 @@ export class Game {
       // Keep the horde milling around behind the menus so it never looks static.
       this.swarm.update(dt, this.car, 0.08);
       this.gore.update(dt);
+      this.fluidTick ^= 1;
+      if (this.fluidTick === 0) this.blood.step(dt * 2);
       this.shake *= Math.exp(-4 * dt);
       return;
     }
@@ -249,6 +366,10 @@ export class Game {
       if (kind === FLAME) this.flameCooldown = Math.min(this.flameCooldown, 0.5);
       this.events.push({ type: 'pickup', kind });
     }
+
+    // ---- wet blood -------------------------------------------------------
+    this.blood.anchor(car.x, car.y);
+    this.slip = clamp(this.blood.sample(car.x, car.y) * SLIP_SCALE, 0, 1);
 
     this.swarm.update(dt, car, this.difficulty);
 
@@ -288,12 +409,12 @@ export class Game {
         const dirx = car.vx / (speed || 1);
         const diry = car.vy / (speed || 1);
         this.killEnemy(e, dirx, diry, speed, e.kind === ZOMBIE ? MEAT : BONE, k.gore);
-        for (let s = 0; s < 4; s++) {
+        for (let s = 0; s < 8; s++) {
           this.emitParticle(
             e.x, e.y,
-            dirx * rr(this.rng, 40, 320) + rr(this.rng, -90, 90),
-            diry * rr(this.rng, 40, 320) + rr(this.rng, -90, 90),
-            rr(this.rng, 0.25, 0.6), rr(this.rng, 1.5, 4),
+            dirx * rr(this.rng, 40, 380) + rr(this.rng, -120, 120),
+            diry * rr(this.rng, 40, 380) + rr(this.rng, -120, 120),
+            rr(this.rng, 0.25, 0.7), rr(this.rng, 1.5, 5),
             e.kind === ZOMBIE ? 0 : 1, this.rng(),
           );
         }
@@ -305,7 +426,7 @@ export class Game {
         if (wired && this.rng() < WIRE_SHRED_RATE * dt) {
           // Caught on the barbed wire and torn apart against the bodywork.
           const inv = 1 / (d || 1);
-          this.killEnemy(e, dx * inv, dy * inv, 90, MEAT, 4);
+          this.killEnemy(e, dx * inv, dy * inv, 90, MEAT, 6);
           this.shredKills++;
           this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed, shredded: true });
         } else {
@@ -330,7 +451,7 @@ export class Game {
     this.grabbers = grabbers;
 
     // ---- drive ---------------------------------------------------------
-    updateCar(car, input, dt, { crowd: this.crowd, gore: this.goreDrag });
+    updateCar(car, input, dt, { crowd: this.crowd, gore: this.goreDrag, slip: this.slip });
 
     // ---- walls ----------------------------------------------------------
     let hitDepth = 0;
@@ -389,6 +510,10 @@ export class Game {
     // ---- gore -----------------------------------------------------------
     this.gore.update(dt);
     this.goreDrag = this.gore.plough(car, crushWidth);
+    this.tyres(dt);
+    // The fluid runs at half rate; it is smooth enough and costs half as much.
+    this.fluidTick ^= 1;
+    if (this.fluidTick === 0) this.blood.step(dt * 2);
 
     // ---- damage and healing ---------------------------------------------
     if (grabDamage > 0) {

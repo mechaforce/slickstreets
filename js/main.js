@@ -59,8 +59,9 @@ function startRun() {
   paused = false;
 }
 
-function handleTouch() {
+function handleTouch(dt) {
   touch.layout(renderer.uw, renderer.uh, renderer.uiScale);
+  touch.tick(dt);
   const taps = touch.consumeTaps();
   if (taps.gear) {
     audio.resume();
@@ -76,7 +77,9 @@ function readInput() {
   const keys = input.read();
   if (keys.throttle !== 0 || keys.steer !== 0) return keys;
   const stick = touch.read(game.car);
-  return stick.active ? { throttle: stick.throttle, steer: stick.steer } : keys;
+  return stick.active
+    ? { throttle: stick.throttle, steer: stick.steer, burnout: stick.burnout }
+    : keys;
 }
 
 function handleKeys() {
@@ -133,7 +136,7 @@ function frame(now) {
   dt = Math.min(dt, 0.25);
 
   handleKeys();
-  handleTouch();
+  handleTouch(dt);
 
   if (!paused) {
     audio.beginFrame();

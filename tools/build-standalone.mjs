@@ -16,6 +16,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Dependency order: every module appears after everything it uses.
 const ORDER = [
   'util.js',
+  'fluid.js',
   'spatialhash.js',
   'city.js',
   'pickups.js',

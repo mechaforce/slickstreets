@@ -14,6 +14,8 @@ const SIDEWALK = '#41434c';
 const PARK = '#2c3b2b';
 const LOT = '#313239';
 const LINE = 'rgba(206,180,88,0.55)';
+const DASH = [26, 22];
+const DASH_PERIOD = DASH[0] + DASH[1];
 
 const TILE_WORLD = 1024;   // world units covered by one decal tile
 const TILE_PX = 512;       // half-resolution: blood does not need to be sharp
@@ -112,6 +114,34 @@ class DecalLayer {
           ctx.arc(sx, sy, sr, 0, TAU);
           ctx.fill();
         }
+      }
+    }
+  }
+
+  /** A tyre mark: a short smear of blood or black rubber on the tarmac. */
+  mark(m, frame) {
+    const half = Math.max(m.w, m.h);
+    const x0 = Math.floor((m.x - half) / TILE_WORLD);
+    const x1 = Math.floor((m.x + half) / TILE_WORLD);
+    const y0 = Math.floor((m.y - half) / TILE_WORLD);
+    const y1 = Math.floor((m.y + half) / TILE_WORLD);
+    const bloody = m.blood === undefined ? 1 : m.blood;
+    // Blood-soaked tyres paint dark red; clean ones lay black rubber.
+    const hue = 356;
+    const sat = Math.round(58 * bloody);
+    const light = Math.round(4 + 9 * bloody);
+    const alpha = Math.min(0.55, m.a * (0.55 + bloody * 0.45));
+
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        const t = this._tile(tx, ty, frame);
+        const ctx = t.ctx;
+        ctx.save();
+        ctx.translate(m.x, m.y);
+        ctx.rotate(m.ang);
+        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`;
+        ctx.fillRect(-m.w * 0.5, -m.h * 0.5, m.w, m.h);
+        ctx.restore();
       }
     }
   }
@@ -242,7 +272,10 @@ export class Renderer {
     this.drawGround(game, view);
     for (const s of game.gore.splats) this.decals.splat(s, this.frame);
     game.gore.splats.length = 0;
+    for (const m of game.marks) this.decals.mark(m, this.frame);
+    game.marks.length = 0;
     this.decals.draw(ctx, view, this.frame);
+    this.drawBlood(game);
     this.drawGore(game, view);
     this.drawPickups(game, view);
     this.drawFlame(game);
@@ -278,19 +311,28 @@ export class Renderer {
     }
 
     // Lane markings down the middle of each street.
+    //
+    // A dash pattern restarts at the beginning of every subpath, so a line
+    // that starts at the edge of the view has a phase that moves with the
+    // camera - the dashes crawl along the road as you drive. Starting each
+    // line on a multiple of the dash period instead pins them to the world.
     ctx.strokeStyle = LINE;
     ctx.lineWidth = 3;
-    ctx.setLineDash([26, 22]);
+    ctx.setLineDash(DASH);
     ctx.beginPath();
+    const top = Math.floor(Math.max(0, view.y) / DASH_PERIOD) * DASH_PERIOD;
+    const bottom = Math.min(city.height, view.y + view.h);
     for (let cx = c0x; cx <= c1x + 1; cx++) {
       const x = cx * CELL;
-      ctx.moveTo(x, Math.max(0, view.y));
-      ctx.lineTo(x, Math.min(city.height, view.y + view.h));
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
     }
+    const left = Math.floor(Math.max(0, view.x) / DASH_PERIOD) * DASH_PERIOD;
+    const right = Math.min(city.width, view.x + view.w);
     for (let cy = c0y; cy <= c1y + 1; cy++) {
       const y = cy * CELL;
-      ctx.moveTo(Math.max(0, view.x), y);
-      ctx.lineTo(Math.min(city.width, view.x + view.w), y);
+      ctx.moveTo(left, y);
+      ctx.lineTo(right, y);
     }
     ctx.stroke();
     ctx.setLineDash([]);
@@ -435,6 +477,52 @@ export class Renderer {
       ctx.drawImage(img, -s * 0.5, -s * 0.5, s, s);
     }
     this.worldTransform(game);
+  }
+
+  /**
+   * The wet blood, straight out of the fluid grid. One small image scaled up
+   * with smoothing: the grid is coarse, but liquid has no hard edges anyway,
+   * and the crisp marks come from the decal layer underneath.
+   */
+  drawBlood(game) {
+    const f = game.blood;
+    if (f.empty || f.wet < 0.04) return;
+    const n = f.n;
+
+    if (this.bloodCanvas === undefined || this.bloodCanvas.width !== n) {
+      this.bloodCanvas = document.createElement('canvas');
+      this.bloodCanvas.width = n;
+      this.bloodCanvas.height = n;
+      this.bloodCtx = this.bloodCanvas.getContext('2d');
+      this.bloodImage = this.bloodCtx.createImageData(n, n);
+    }
+
+    const px = this.bloodImage.data;
+    px.fill(0);
+    const d = f.d;
+    for (let j = f.bj0; j <= f.bj1; j++) {
+      const row = j * n;
+      for (let i = f.bi0; i <= f.bi1; i++) {
+        const v = d[i + row];
+        if (v <= 0.002) continue;
+        const a = clamp(v * 2.3 - 0.05, 0, 0.9);
+        if (a <= 0) continue;
+        const t = clamp(v, 0, 1);
+        const o = (i + row) * 4;
+        px[o] = 156 - 84 * t;       // thin blood is brighter, deep is near-black
+        px[o + 1] = 26 - 18 * t;
+        px[o + 2] = 24 - 12 * t;
+        px[o + 3] = a * 255;
+      }
+    }
+    this.bloodCtx.putImageData(this.bloodImage, 0, 0);
+
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'low';
+    ctx.drawImage(this.bloodCanvas, f.ox, f.oy, f.width, f.width);
+    ctx.restore();
   }
 
   drawPickups(game, view) {

@@ -124,6 +124,384 @@ function damp(rate, dt) {
 }
 
 // ==================================================================
+// js/fluid.js
+// ==================================================================
+
+// A light 2D fluid for the blood: semi-Lagrangian advection with a few
+// Gauss-Seidel pressure iterations, in the style of Stam's stable fluids.
+//
+// It only covers a window of the city around the car. Blood that leaves the
+// window is gone from the simulation, which is fine - by then it has already
+// been baked into the permanent stains the renderer keeps. So this layer is
+// the *wet* blood: it pools, it gets dragged and thrown by the tyres, and it
+// is what makes the road slippery.
+//
+// No DOM in here; the renderer reads the grid out and draws it.
+
+const CELL_SIZE = 18;
+const GRID = 128;            // 128 * 18 = 2304px of city
+const SLACK = 8;                    // cells of drift before the window moves
+const PRESSURE_ITERS = 4;
+
+/** Velocities are stored in cells per second, densities in "how bloody". */
+class BloodField {
+  constructor(cells = GRID, cellSize = CELL_SIZE) {
+    this.n = cells;
+    this.cs = cellSize;
+    this.size = cells * cells;
+    this.d = new Float32Array(this.size);
+    this.u = new Float32Array(this.size);
+    this.v = new Float32Array(this.size);
+    this.d0 = new Float32Array(this.size);
+    this.u0 = new Float32Array(this.size);
+    this.v0 = new Float32Array(this.size);
+    this.p = new Float32Array(this.size);
+    this.div = new Float32Array(this.size);
+    this.tmp = new Float32Array(this.size);
+    this.ox = 0;
+    this.oy = 0;
+    this.wet = 0; // total density, so callers can skip work on a clean road
+    // Only the part of the grid that actually has blood in it is simulated;
+    // on a clean road that is nothing at all.
+    this.bi0 = 0; this.bi1 = -1; this.bj0 = 0; this.bj1 = -1;
+  }
+
+  get empty() { return this.bi1 < this.bi0; }
+
+  /** Grow the simulated region to include a cell range. */
+  _touch(i0, i1, j0, j1) {
+    const n = this.n;
+    if (i1 < 0 || j1 < 0 || i0 > n - 1 || j0 > n - 1) return;
+    if (this.empty) {
+      this.bi0 = Math.max(0, i0); this.bi1 = Math.min(n - 1, i1);
+      this.bj0 = Math.max(0, j0); this.bj1 = Math.min(n - 1, j1);
+      return;
+    }
+    if (i0 < this.bi0) this.bi0 = Math.max(0, i0);
+    if (i1 > this.bi1) this.bi1 = Math.min(n - 1, i1);
+    if (j0 < this.bj0) this.bj0 = Math.max(0, j0);
+    if (j1 > this.bj1) this.bj1 = Math.min(n - 1, j1);
+  }
+
+  reset() {
+    this.d.fill(0);
+    this.u.fill(0);
+    this.v.fill(0);
+    this.wet = 0;
+    this.bi0 = 0; this.bi1 = -1; this.bj0 = 0; this.bj1 = -1;
+  }
+
+  get width() { return this.n * this.cs; }
+
+  // ---- window ------------------------------------------------------------
+
+  /** Keep the simulated window centred on a point, moving it in whole cells. */
+  anchor(x, y) {
+    const half = this.n * 0.5 * this.cs;
+    const di = Math.round((x - half - this.ox) / this.cs);
+    const dj = Math.round((y - half - this.oy) / this.cs);
+    if (Math.abs(di) < SLACK && Math.abs(dj) < SLACK) return;
+    if (Math.abs(di) >= this.n || Math.abs(dj) >= this.n) {
+      // Teleported somewhere else entirely: nothing to carry over.
+      this.reset();
+    } else {
+      this._shift(this.d, di, dj);
+      this._shift(this.u, di, dj);
+      this._shift(this.v, di, dj);
+      if (!this.empty) {
+        const n = this.n;
+        this.bi0 = Math.max(0, this.bi0 - di);
+        this.bi1 = Math.min(n - 1, this.bi1 - di);
+        this.bj0 = Math.max(0, this.bj0 - dj);
+        this.bj1 = Math.min(n - 1, this.bj1 - dj);
+        if (this.bi1 < this.bi0 || this.bj1 < this.bj0) {
+          this.bi1 = -1; this.bj1 = -1;
+        }
+      }
+    }
+    this.ox += di * this.cs;
+    this.oy += dj * this.cs;
+  }
+
+  _shift(f, di, dj) {
+    const n = this.n;
+    const tmp = this.tmp;
+    tmp.set(f);
+    f.fill(0);
+    for (let j = 0; j < n; j++) {
+      const sj = j + dj;
+      if (sj < 0 || sj >= n) continue;
+      const row = j * n;
+      const srow = sj * n;
+      for (let i = 0; i < n; i++) {
+        const si = i + di;
+        if (si < 0 || si >= n) continue;
+        f[i + row] = tmp[si + srow];
+      }
+    }
+  }
+
+  // ---- reading and writing ------------------------------------------------
+
+  /** Grid coordinate of a world point (may be outside the window). */
+  gx(x) { return (x - this.ox) / this.cs; }
+  gy(y) { return (y - this.oy) / this.cs; }
+
+  /** Bilinear density at a world point. 0 on dry road. */
+  sample(x, y) {
+    const n = this.n;
+    const fx = this.gx(x);
+    const fy = this.gy(y);
+    if (fx < 0 || fy < 0 || fx >= n - 1 || fy >= n - 1) return 0;
+    const i = fx | 0;
+    const j = fy | 0;
+    const sx = fx - i;
+    const sy = fy - j;
+    const k = i + j * n;
+    const d = this.d;
+    return (d[k] * (1 - sx) + d[k + 1] * sx) * (1 - sy)
+         + (d[k + n] * (1 - sx) + d[k + n + 1] * sx) * sy;
+  }
+
+  /** Pour blood in, optionally throwing it in a direction. */
+  add(x, y, amount, wvx = 0, wvy = 0, radius = 20) {
+    const n = this.n;
+    const cs = this.cs;
+    const fx = this.gx(x);
+    const fy = this.gy(y);
+    const r = Math.max(0.8, radius / cs);
+    const i0 = Math.max(0, Math.floor(fx - r));
+    const i1 = Math.min(n - 1, Math.ceil(fx + r));
+    const j0 = Math.max(0, Math.floor(fy - r));
+    const j1 = Math.min(n - 1, Math.ceil(fy + r));
+    if (i1 < i0 || j1 < j0) return;
+    this._touch(i0, i1, j0, j1);
+
+    const vx = wvx / cs;
+    const vy = wvy / cs;
+    const r2 = r * r;
+    for (let j = j0; j <= j1; j++) {
+      const dy = j - fy;
+      for (let i = i0; i <= i1; i++) {
+        const dx = i - fx;
+        const q = (dx * dx + dy * dy) / r2;
+        if (q > 1) continue;
+        const w = 1 - q;
+        const k = i + j * n;
+        this.d[k] += amount * w;
+        this.u[k] += vx * w;
+        this.v[k] += vy * w;
+      }
+    }
+  }
+
+  /** Drag whatever is here, without adding any more of it. */
+  addVelocity(x, y, wvx, wvy, radius = 20) {
+    const n = this.n;
+    const cs = this.cs;
+    const fx = this.gx(x);
+    const fy = this.gy(y);
+    const r = Math.max(0.8, radius / cs);
+    const i0 = Math.max(0, Math.floor(fx - r));
+    const i1 = Math.min(n - 1, Math.ceil(fx + r));
+    const j0 = Math.max(0, Math.floor(fy - r));
+    const j1 = Math.min(n - 1, Math.ceil(fy + r));
+    if (i1 < i0 || j1 < j0) return;
+    this._touch(i0, i1, j0, j1);
+
+    const vx = wvx / cs;
+    const vy = wvy / cs;
+    const r2 = r * r;
+    for (let j = j0; j <= j1; j++) {
+      const dy = j - fy;
+      for (let i = i0; i <= i1; i++) {
+        const dx = i - fx;
+        const q = (dx * dx + dy * dy) / r2;
+        if (q > 1) continue;
+        const w = 1 - q;
+        const k = i + j * n;
+        this.u[k] += vx * w;
+        this.v[k] += vy * w;
+      }
+    }
+  }
+
+  /** Scoop blood up off the road - what the tyres pick up and carry away. */
+  take(x, y, fraction, radius = 16) {
+    const n = this.n;
+    const fx = this.gx(x);
+    const fy = this.gy(y);
+    const r = Math.max(0.8, radius / this.cs);
+    const i0 = Math.max(0, Math.floor(fx - r));
+    const i1 = Math.min(n - 1, Math.ceil(fx + r));
+    const j0 = Math.max(0, Math.floor(fy - r));
+    const j1 = Math.min(n - 1, Math.ceil(fy + r));
+    let taken = 0;
+    const r2 = r * r;
+    for (let j = j0; j <= j1; j++) {
+      const dy = j - fy;
+      for (let i = i0; i <= i1; i++) {
+        const dx = i - fx;
+        const q = (dx * dx + dy * dy) / r2;
+        if (q > 1) continue;
+        const k = i + j * n;
+        const got = this.d[k] * fraction * (1 - q);
+        this.d[k] -= got;
+        taken += got;
+      }
+    }
+    return taken;
+  }
+
+  // ---- the simulation ------------------------------------------------------
+
+  _advect(dst, src, dt) {
+    const n = this.n;
+    const u = this.u;
+    const v = this.v;
+    const max = n - 1.001;
+    for (let j = this.bj0; j <= this.bj1; j++) {
+      const row = j * n;
+      for (let i = this.bi0; i <= this.bi1; i++) {
+        const k = i + row;
+        let x = i - dt * u[k];
+        let y = j - dt * v[k];
+        if (x < 0) x = 0; else if (x > max) x = max;
+        if (y < 0) y = 0; else if (y > max) y = max;
+        const i0 = x | 0;
+        const j0 = y | 0;
+        const sx = x - i0;
+        const sy = y - j0;
+        const a = i0 + j0 * n;
+        dst[k] = (src[a] * (1 - sx) + src[a + 1] * sx) * (1 - sy)
+               + (src[a + n] * (1 - sx) + src[a + n + 1] * sx) * sy;
+      }
+    }
+  }
+
+  /** Push the velocity field toward divergence-free - this is what swirls. */
+  _project() {
+    const n = this.n;
+    const u = this.u;
+    const v = this.v;
+    const p = this.p;
+    const div = this.div;
+    const i0 = Math.max(1, this.bi0);
+    const i1 = Math.min(n - 2, this.bi1);
+    const j0 = Math.max(1, this.bj0);
+    const j1 = Math.min(n - 2, this.bj1);
+
+    for (let j = j0; j <= j1; j++) {
+      const row = j * n;
+      for (let i = i0; i <= i1; i++) {
+        const k = i + row;
+        div[k] = -0.5 * (u[k + 1] - u[k - 1] + v[k + n] - v[k - n]);
+        p[k] = 0;
+      }
+    }
+    for (let it = 0; it < PRESSURE_ITERS; it++) {
+      for (let j = j0; j <= j1; j++) {
+        const row = j * n;
+        for (let i = i0; i <= i1; i++) {
+          const k = i + row;
+          p[k] = (div[k] + p[k - 1] + p[k + 1] + p[k - n] + p[k + n]) * 0.25;
+        }
+      }
+    }
+    for (let j = j0; j <= j1; j++) {
+      const row = j * n;
+      for (let i = i0; i <= i1; i++) {
+        const k = i + row;
+        u[k] -= 0.5 * (p[k + 1] - p[k - 1]);
+        v[k] -= 0.5 * (p[k + n] - p[k - n]);
+      }
+    }
+  }
+
+  /** A touch of spreading, so pools have soft edges rather than hard cells. */
+  _diffuse(amount) {
+    const n = this.n;
+    const d = this.d;
+    const t = this.tmp;
+    t.set(d);
+    const keep = 1 - amount;
+    const i0 = Math.max(1, this.bi0);
+    const i1 = Math.min(n - 2, this.bi1);
+    const j0 = Math.max(1, this.bj0);
+    const j1 = Math.min(n - 2, this.bj1);
+    for (let j = j0; j <= j1; j++) {
+      const row = j * n;
+      for (let i = i0; i <= i1; i++) {
+        const k = i + row;
+        d[k] = t[k] * keep
+          + (t[k - 1] + t[k + 1] + t[k - n] + t[k + n]) * (amount * 0.25);
+      }
+    }
+  }
+
+  step(dt) {
+    if (dt <= 0 || this.empty) return;
+    const damp = Math.exp(-3.4 * dt);   // blood is viscous; it stops quickly
+    const dry = Math.exp(-0.085 * dt);  // and slowly soaks into the tarmac
+
+    // Room for this step's spreading and advection to move into.
+    this._touch(this.bi0 - 2, this.bi1 + 2, this.bj0 - 2, this.bj1 + 2);
+
+    const n = this.n;
+    const u = this.u;
+    const v = this.v;
+    for (let j = this.bj0; j <= this.bj1; j++) {
+      const row = j * n;
+      for (let i = this.bi0; i <= this.bi1; i++) {
+        u[i + row] *= damp;
+        v[i + row] *= damp;
+      }
+    }
+
+    // Self-advection then projection: the swirl in the smear comes from here.
+    this.u0.set(u);
+    this.v0.set(v);
+    this._advect(u, this.u0, dt);
+    this._advect(v, this.v0, dt);
+    this._project();
+
+    this.d0.set(this.d);
+    this._advect(this.d, this.d0, dt);
+    this._diffuse(Math.min(0.5, 1.6 * dt));
+
+    // Dry it off, and shrink the active region back around what is left.
+    const d = this.d;
+    let total = 0;
+    let ni0 = n;
+    let ni1 = -1;
+    let nj0 = n;
+    let nj1 = -1;
+    for (let j = this.bj0; j <= this.bj1; j++) {
+      const row = j * n;
+      for (let i = this.bi0; i <= this.bi1; i++) {
+        const k = i + row;
+        const val = d[k] * dry;
+        if (val < 0.0008) {
+          d[k] = 0;
+          u[k] = 0;
+          v[k] = 0;
+          continue;
+        }
+        d[k] = val;
+        total += val;
+        if (i < ni0) ni0 = i;
+        if (i > ni1) ni1 = i;
+        if (j < nj0) nj0 = j;
+        if (j > nj1) nj1 = j;
+      }
+    }
+    this.wet = total;
+    this.bi0 = ni0; this.bi1 = ni1;
+    this.bj0 = nj0; this.bj1 = nj1;
+  }
+}
+
+// ==================================================================
 // js/spatialhash.js
 // ==================================================================
 
@@ -613,6 +991,8 @@ const REVERSE_ARC = 2.36; // radians, 135 degrees
 const DEADZONE = 0.18;
 const STEER_GAIN = 2.4;
 
+/** Hold the gear button this long and it becomes a burnout instead. */
+const HOLD_FOR_BURNOUT = 0.3;
 const STICK_RADIUS = 74;   // logical px from base to full deflection
 const BUTTON_RADIUS = 52;
 
@@ -657,7 +1037,7 @@ class TouchControls {
     this.h = 0;
 
     this.stick = { id: -1, down: false, baseX: 0, baseY: 0, dx: 0, dy: 0 };
-    this.gear = { id: -1, x: 0, y: 0, r: BUTTON_RADIUS, down: false };
+    this.gear = { id: -1, x: 0, y: 0, r: BUTTON_RADIUS, down: false, heldFor: 0 };
     this.pause = { id: -1, x: 0, y: 0, r: 20, down: false };
     this.taps = { gear: false, pause: false };
 
@@ -673,6 +1053,11 @@ class TouchControls {
     target.addEventListener('pointerup', (e) => this._up(e), opts);
     target.addEventListener('pointercancel', (e) => this._up(e), opts);
     target.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  /** Holding the gear button down, rather than tapping it, does a burnout. */
+  get burnout() {
+    return this.enabled && this.gear.down && this.gear.heldFor > HOLD_FOR_BURNOUT;
   }
 
   /** Position the controls for the current screen, in logical HUD units. */
@@ -779,14 +1164,23 @@ class TouchControls {
     }
   }
 
+  /** Advance button hold timers. */
+  tick(dt) {
+    if (this.gear.down) this.gear.heldFor += dt;
+    else this.gear.heldFor = 0;
+  }
+
   /** Current throttle and steering, given what the car is doing. */
   read(car) {
-    if (!this.enabled || !this.stick.down) return { throttle: 0, steer: 0, active: false };
-    return stickToInput(
-      car.ang, car.speed,
-      this.stick.dx / STICK_RADIUS,
-      this.stick.dy / STICK_RADIUS,
-    );
+    const burning = this.burnout;
+    if (!this.enabled || (!this.stick.down && !burning)) {
+      return { throttle: 0, steer: 0, active: burning, burnout: burning };
+    }
+    const r = this.stick.down
+      ? stickToInput(car.ang, car.speed, this.stick.dx / STICK_RADIUS, this.stick.dy / STICK_RADIUS)
+      : { throttle: 0, steer: 0, active: true };
+    // While burning out the stick only steers - the throttle is pinned.
+    return { throttle: burning ? 0 : r.throttle, steer: r.steer, active: true, burnout: burning };
   }
 
   /** Button presses since the last call. */
@@ -833,6 +1227,8 @@ const GEARS = [
 const REVERSE_SPEED = 130;
 /** Acceleration applied per unit of crowd pressure (pressure 1 = fully mobbed). */
 const CROWD_DRAG = 640;
+/** Grip lost on a road slick with blood, at full depth. */
+const TRACTION_LOSS = 0.58;
 
 function createCar(x, y, ang = 0) {
   return {
@@ -843,6 +1239,8 @@ function createCar(x, y, ang = 0) {
     rpm: 0,          // 0..1, for the engine note and the tacho
     steer: 0,        // smoothed steering input
     lastImpact: 0,   // speed lost to the most recent wall hit
+    wheelspin: 0,    // 0..1, how much the tyres are losing to the road
+    tyreBlood: 0,    // 0..1, how much blood the tyres are carrying
   };
 }
 
@@ -865,13 +1263,15 @@ function torqueAt(gear, speed) {
 
 /**
  * Advance the car one step.
- *   input: { throttle: -1..1, steer: -1..1 }
- *   env:   { crowd: 0..1+ swarm pressure, gore: 0..1 gore drag }
+ *   input: { throttle: -1..1, steer: -1..1, burnout: bool }
+ *   env:   { crowd: swarm pressure, gore: gore drag, slip: 0..1 blood depth }
  */
 function updateCar(car, input, dt, env) {
   const g = GEARS[car.gear];
   const crowd = env && env.crowd ? env.crowd : 0;
   const gore = env && env.gore ? env.gore : 0;
+  const slip = env && env.slip ? clamp(env.slip, 0, 1) : 0;
+  const burnout = !!(input && input.burnout);
 
   const cos = Math.cos(car.ang);
   const sin = Math.sin(car.ang);
@@ -883,10 +1283,26 @@ function updateCar(car, input, dt, env) {
   const throttle = clamp(input.throttle || 0, -1, 1);
 
   let accel = 0;
-  if (throttle > 0) {
+  let spin = 0;
+  if (burnout) {
+    // Throttle and brake together: the brakes hold the car while the engine
+    // lights the tyres up. Barely moves, spins like mad, and on a wet road
+    // throws a great deal of blood about.
+    spin = 1;
+    accel = (45 - fwd) * 6;
+  } else if (throttle > 0) {
     const torque = torqueAt(car.gear, Math.max(0, fwd));
     const headroom = 1 - Math.pow(clamp(fwd / g.maxSpeed, 0, 1), 1.6);
-    accel = g.force * torque * headroom * throttle;
+    const demand = g.force * torque * headroom * throttle;
+    // What the tyres can actually put down. Blood costs you most of it, and
+    // low gear has the torque to break traction where high gear does not.
+    const hold = g.force * (1 - TRACTION_LOSS * slip);
+    if (demand > hold) {
+      spin = clamp((demand - hold) / g.force, 0, 1);
+      accel = hold;
+    } else {
+      accel = demand;
+    }
   } else if (throttle < 0) {
     // Brake hard while rolling forward, then creep backwards.
     accel = fwd > 12 ? -1500 * -throttle : -520 * -throttle;
@@ -903,25 +1319,42 @@ function updateCar(car, input, dt, env) {
   if (fwd < -REVERSE_SPEED) fwd = -REVERSE_SPEED;
   if (Math.abs(fwd) < 1.5 && throttle === 0) fwd = 0;
 
-  // Tyres scrub off sideways velocity; less grip when the crowd is shoving.
-  lat -= lat * Math.min(1, g.grip * dt * (1 - 0.35 * clamp(crowd, 0, 1)));
+  car.wheelspin += (spin - car.wheelspin) * Math.min(1, dt * 9);
+
+  // Tyres scrub off sideways velocity; less grip when the crowd is shoving,
+  // and much less on blood or with the wheels already spinning.
+  const gripLoss = clamp(0.55 * slip + 0.45 * car.wheelspin, 0, 0.82);
+  lat -= lat * Math.min(1, g.grip * (1 - gripLoss) * dt * (1 - 0.35 * clamp(crowd, 0, 1)));
 
   // Steering authority falls away at very low and very high speed.
   const target = clamp(input.steer || 0, -1, 1);
   car.steer += (target - car.steer) * Math.min(1, dt * 12);
-  const gripSpeed = clamp(Math.abs(fwd) / 90, 0, 1);
+  // Steering needs some speed to bite - except in a burnout, where the point
+  // is to be able to swing the car round on the spot.
+  const gripSpeed = Math.max(clamp(Math.abs(fwd) / 90, 0, 1), burnout ? 0.9 : 0);
   const fast = 1 - 0.45 * clamp(Math.abs(fwd) / g.maxSpeed, 0, 1);
-  car.ang += car.steer * g.turn * gripSpeed * fast * sign(fwd || 1) * dt;
+  const dAng = car.steer * g.turn * gripSpeed * fast * sign(fwd || 1) * dt;
+  car.ang += dAng;
   if (car.ang > Math.PI) car.ang -= TAU;
   if (car.ang < -Math.PI) car.ang += TAU;
 
-  const c2 = Math.cos(car.ang);
-  const s2 = Math.sin(car.ang);
-  car.vx = fwd * c2 - lat * s2;
-  car.vy = fwd * s2 + lat * c2;
+  // Put the velocity back into world space in the heading we started with...
+  const wvx = fwd * cos - lat * sin;
+  const wvy = fwd * sin + lat * cos;
+
+  // ...then swing the momentum round after the nose only as far as the tyres
+  // can drag it. With full grip it follows exactly and the car goes where it
+  // points; on blood the nose comes round while the car keeps sliding the way
+  // it was already going, which is what makes a slick road feel slick.
+  const rot = dAng * (1 - gripLoss);
+  const cr = Math.cos(rot);
+  const sr = Math.sin(rot);
+  car.vx = wvx * cr - wvy * sr;
+  car.vy = wvx * sr + wvy * cr;
+
   car.x += car.vx * dt;
   car.y += car.vy * dt;
-  car.speed = fwd;
+  car.speed = car.vx * Math.cos(car.ang) + car.vy * Math.sin(car.ang);
 
   const targetRpm = clamp(Math.abs(fwd) / g.maxSpeed, 0, 1) * 0.8 + (throttle > 0 ? 0.2 : 0.05);
   car.rpm += (targetRpm - car.rpm) * Math.min(1, dt * 6);
@@ -1002,8 +1435,8 @@ const SKELETON = 1;
  * they get to you first and claw harder.
  */
 const KINDS = [
-  { name: 'zombie',   radius: 9,   speed: [42, 74],  killSpeed: 88, mass: 1.0, damage: 3.2, drag: 1.0, gore: 6 },
-  { name: 'skeleton', radius: 7.5, speed: [86, 128], killSpeed: 52, mass: 0.55, damage: 5.0, drag: 0.6, gore: 3 },
+  { name: 'zombie',   radius: 9,   speed: [42, 74],  killSpeed: 88, mass: 1.0, damage: 3.2, drag: 1.0, gore: 10 },
+  { name: 'skeleton', radius: 7.5, speed: [86, 128], killSpeed: 52, mass: 0.55, damage: 5.0, drag: 0.6, gore: 6 },
 ];
 
 const ACTIVE_RADIUS = 1750;   // full-rate AI inside this radius of the car
@@ -1256,7 +1689,7 @@ class Swarm {
 
 
 
-const MAX_CHUNKS = 3200;
+const MAX_CHUNKS = 4600;
 
 const MEAT = 0;
 const BONE = 1;
@@ -1310,7 +1743,7 @@ class GoreField {
       c.y = y + rr(rng, -6, 6);
       c.vx = Math.cos(a) * sp;
       c.vy = Math.sin(a) * sp;
-      c.r = kind === MEAT ? rr(rng, 4.5, 11) : rr(rng, 3, 6.5);
+      c.r = kind === MEAT ? rr(rng, 5, 13) : rr(rng, 3.2, 7);
       c.rot = rr(rng, 0, TAU);
       c.spin = rr(rng, -6, 6);
       c.type = kind;
@@ -1319,9 +1752,10 @@ class GoreField {
       c.moving = true;
       c.age = 0;
     }
+    if (this.splats.length > 512) this.splats.shift();
     this.splats.push({
       x, y,
-      r: (kind === MEAT ? 34 : 22) + power * 0.06,
+      r: (kind === MEAT ? 40 : 25) + power * 0.07,
       tone: this.rng(),
       kind,
       dirx, diry,
@@ -1437,6 +1871,7 @@ class GoreField {
 
 
 
+
 const MAX_HEALTH = 100;
 const CROWD_RADIUS = 82;
 const CROWD_NORM = 15;      // enemies-worth of pressure that counts as "mobbed"
@@ -1446,7 +1881,7 @@ const REGEN_RATE = 3.0;
 const COMBO_WINDOW = 1.4;
 const RAMP_SECONDS = 260;   // time to reach maximum horde density
 
-const MAX_PARTICLES = 900;
+const MAX_PARTICLES = 1400;
 
 /** Chance per second that any one enemy touching the wire is shredded by it. */
 const WIRE_SHRED_RATE = 0.9;
@@ -1459,6 +1894,19 @@ const FLAME_GAP = [3, 5];
 const FLAME_SPRAY = 0.6;
 const FLAME_RANGE = 205;
 const FLAME_HALF_ANGLE = 0.44;
+
+/** How much wet blood each kind of kill pours onto the road. */
+const BLOOD_PER_KILL = [0.3, 0.1, 0];   // meat, bone, charred
+/** Wet blood depth that counts as a fully slick road. */
+const SLIP_SCALE = 1.25;
+/** Distance between tyre marks laid down while the tyres are bloody. */
+const TRACK_SPACING = 9;
+/**
+ * The renderer bakes these and clears them. Cap them so a headless run - or a
+ * frame where the simulation steps several times before one draw - cannot let
+ * them grow without bound.
+ */
+const MAX_PENDING_MARKS = 512;
 
 class Game {
   constructor(seed = Date.now()) {
@@ -1483,6 +1931,7 @@ class Game {
     this.swarm = new Swarm(this.city, this.seed);
     this.gore = new GoreField(this.seed);
     this.pickups = new PickupField(this.city, this.seed);
+    this.blood = new BloodField();
 
     // Start on an intersection near the middle of the map.
     const c = this.city.cell;
@@ -1490,6 +1939,7 @@ class Game {
     const gy = Math.floor(this.city.rows / 2) * c;
     this.car = createCar(gx, gy, -Math.PI / 2);
     this.car.gear = GEAR_HIGH;
+    this.blood.anchor(gx, gy);
 
     this.state = 'title';
     this.time = 0;
@@ -1517,6 +1967,11 @@ class Game {
     this.shredKills = 0;
     this.burnKills = 0;
     this._collected = [];
+    this.slip = 0;
+    this.trackDist = 0;
+    this.fluidTick = 0;
+    /** Tyre marks waiting to be baked into the permanent stains. */
+    this.marks = [];
     for (const p of this.particles) p.live = false;
     this.events.length = 0;
     this._seedAttractHorde();
@@ -1546,6 +2001,8 @@ class Game {
     // every run starts with room to get moving rather than already buried.
     this.swarm.reset();
     this.gore.reset();
+    this.blood.reset();
+    this.marks.length = 0;
     this.state = 'playing';
     this.events.push({ type: 'start' });
   }
@@ -1587,6 +2044,11 @@ class Game {
   killEnemy(e, dirx, diry, power, goreKind, amount) {
     const k = KINDS[e.kind];
     this.gore.burst(e.x, e.y, dirx, diry, power, goreKind, amount);
+    const wet = BLOOD_PER_KILL[goreKind];
+    if (wet > 0) {
+      // Thrown along the direction of the hit, so it sprays rather than pools.
+      this.blood.add(e.x, e.y, wet, dirx * power * 0.45, diry * power * 0.45, 24);
+    }
     this.swarm.kill(e);
     this.kills++;
     if (e.kind === ZOMBIE) this.zombieKills++; else this.skeletonKills++;
@@ -1595,6 +2057,92 @@ class Game {
     if (this.combo > this.bestCombo) this.bestCombo = this.combo;
     this.score += Math.round(10 * (1 + Math.min(this.combo, 40) * 0.05));
     return k;
+  }
+
+  /**
+   * Everything the tyres do to the wet blood: drag it about, pick it up, and
+   * lay it back down as tracks. This is what carves a legible path through a
+   * pool and what a burnout throws everywhere.
+   */
+  tyres(dt) {
+    const car = this.car;
+    const blood = this.blood;
+    const cos = Math.cos(car.ang);
+    const sin = Math.sin(car.ang);
+    const speed = Math.hypot(car.vx, car.vy);
+    const spin = car.wheelspin;
+    const wet = this.slip;
+    const halfW = CAR_WIDTH * 0.5;
+
+    // Front and rear, left and right.
+    const wheels = [
+      [CAR_LENGTH * 0.30, -halfW], [CAR_LENGTH * 0.30, halfW],
+      [-CAR_LENGTH * 0.30, -halfW], [-CAR_LENGTH * 0.30, halfW],
+    ];
+
+    let picked = 0;
+    for (let i = 0; i < wheels.length; i++) {
+      const [lx, ly] = wheels[i];
+      const wx = car.x + cos * lx - sin * ly;
+      const wy = car.y + sin * lx + cos * ly;
+      const rear = i >= 2;
+
+      if (wet > 0.01) {
+        // Drag whatever the tyre is standing in along with the car.
+        if (speed > 18) blood.addVelocity(wx, wy, car.vx * 0.5, car.vy * 0.5, 14);
+        picked += blood.take(wx, wy, 0.16 + spin * 0.3, 13);
+      }
+
+      // A spinning rear wheel throws blood backwards in a rooster tail.
+      if (rear && spin > 0.2) {
+        const throwSpeed = 120 + spin * 520;
+        const jitter = rr(this.rng, -0.5, 0.5);
+        const a = car.ang + Math.PI + jitter;
+        blood.addVelocity(wx, wy, Math.cos(a) * throwSpeed, Math.sin(a) * throwSpeed, 17);
+
+        if (wet > 0.04) {
+          for (let s = 0; s < 2; s++) {
+            const pa = car.ang + Math.PI + rr(this.rng, -0.7, 0.7);
+            const sp = rr(this.rng, 90, 380) * spin;
+            this.emitParticle(wx, wy, Math.cos(pa) * sp + car.vx, Math.sin(pa) * sp + car.vy,
+              rr(this.rng, 0.3, 0.75), rr(this.rng, 2, 5), 0, this.rng());
+          }
+        }
+        // Tyre smoke, blood or no blood.
+        if (this.rng() < 0.7) {
+          this.emitParticle(wx, wy, rr(this.rng, -50, 50) + car.vx * 0.3,
+            rr(this.rng, -50, 50) + car.vy * 0.3,
+            rr(this.rng, 0.5, 1.2), rr(this.rng, 5, 11), 4, this.rng());
+        }
+      }
+    }
+
+    car.tyreBlood = clamp(car.tyreBlood + picked * 2.6 - dt * 0.28, 0, 1);
+
+    // Lay tracks at a fixed spacing along the ground, not per frame, so they
+    // do not bunch up when slow or leave gaps when quick.
+    this.trackDist += speed * dt;
+    const laying = car.tyreBlood > 0.02 || spin > 0.25;
+    if (laying && (this.trackDist >= TRACK_SPACING || spin > 0.25)) {
+      this.trackDist = 0;
+      const strength = clamp(car.tyreBlood * 0.9 + spin * 0.5, 0.08, 1);
+      for (let i = 2; i < 4; i++) {
+        const [lx, ly] = wheels[i];
+        this.marks.push({
+          x: car.x + cos * lx - sin * ly,
+          y: car.y + sin * lx + cos * ly,
+          ang: car.ang,
+          w: 15 + spin * 12,
+          h: 8 + spin * 5,
+          a: strength * (0.3 + spin * 0.45),
+          blood: clamp(car.tyreBlood * 1.3 + wet, 0, 1),
+        });
+      }
+      car.tyreBlood = Math.max(0, car.tyreBlood - 0.035);
+      if (this.marks.length > MAX_PENDING_MARKS) {
+        this.marks.splice(0, this.marks.length - MAX_PENDING_MARKS);
+      }
+    }
   }
 
   /** The flamethrower's cone, swept every frame while it is spraying. */
@@ -1616,7 +2164,7 @@ class Game {
       if (d > FLAME_RANGE) continue;
       // Inside the cone? Everything close to the muzzle counts.
       if (d > 26 && (dx * cos + dy * sin) / d < Math.cos(FLAME_HALF_ANGLE)) continue;
-      this.killEnemy(e, dx / (d || 1), dy / (d || 1), 120, CHAR, 3);
+      this.killEnemy(e, dx / (d || 1), dy / (d || 1), 120, CHAR, 5);
       this.burnKills++;
       this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed: 0, burned: true });
       for (let s2 = 0; s2 < 3; s2++) {
@@ -1652,6 +2200,8 @@ class Game {
       // Keep the horde milling around behind the menus so it never looks static.
       this.swarm.update(dt, this.car, 0.08);
       this.gore.update(dt);
+      this.fluidTick ^= 1;
+      if (this.fluidTick === 0) this.blood.step(dt * 2);
       this.shake *= Math.exp(-4 * dt);
       return;
     }
@@ -1675,6 +2225,10 @@ class Game {
       if (kind === FLAME) this.flameCooldown = Math.min(this.flameCooldown, 0.5);
       this.events.push({ type: 'pickup', kind });
     }
+
+    // ---- wet blood -------------------------------------------------------
+    this.blood.anchor(car.x, car.y);
+    this.slip = clamp(this.blood.sample(car.x, car.y) * SLIP_SCALE, 0, 1);
 
     this.swarm.update(dt, car, this.difficulty);
 
@@ -1714,12 +2268,12 @@ class Game {
         const dirx = car.vx / (speed || 1);
         const diry = car.vy / (speed || 1);
         this.killEnemy(e, dirx, diry, speed, e.kind === ZOMBIE ? MEAT : BONE, k.gore);
-        for (let s = 0; s < 4; s++) {
+        for (let s = 0; s < 8; s++) {
           this.emitParticle(
             e.x, e.y,
-            dirx * rr(this.rng, 40, 320) + rr(this.rng, -90, 90),
-            diry * rr(this.rng, 40, 320) + rr(this.rng, -90, 90),
-            rr(this.rng, 0.25, 0.6), rr(this.rng, 1.5, 4),
+            dirx * rr(this.rng, 40, 380) + rr(this.rng, -120, 120),
+            diry * rr(this.rng, 40, 380) + rr(this.rng, -120, 120),
+            rr(this.rng, 0.25, 0.7), rr(this.rng, 1.5, 5),
             e.kind === ZOMBIE ? 0 : 1, this.rng(),
           );
         }
@@ -1731,7 +2285,7 @@ class Game {
         if (wired && this.rng() < WIRE_SHRED_RATE * dt) {
           // Caught on the barbed wire and torn apart against the bodywork.
           const inv = 1 / (d || 1);
-          this.killEnemy(e, dx * inv, dy * inv, 90, MEAT, 4);
+          this.killEnemy(e, dx * inv, dy * inv, 90, MEAT, 6);
           this.shredKills++;
           this.events.push({ type: 'kill', x: e.x, y: e.y, kind: e.kind, speed, shredded: true });
         } else {
@@ -1756,7 +2310,7 @@ class Game {
     this.grabbers = grabbers;
 
     // ---- drive ---------------------------------------------------------
-    updateCar(car, input, dt, { crowd: this.crowd, gore: this.goreDrag });
+    updateCar(car, input, dt, { crowd: this.crowd, gore: this.goreDrag, slip: this.slip });
 
     // ---- walls ----------------------------------------------------------
     let hitDepth = 0;
@@ -1815,6 +2369,10 @@ class Game {
     // ---- gore -----------------------------------------------------------
     this.gore.update(dt);
     this.goreDrag = this.gore.plough(car, crushWidth);
+    this.tyres(dt);
+    // The fluid runs at half rate; it is smooth enough and costs half as much.
+    this.fluidTick ^= 1;
+    if (this.fluidTick === 0) this.blood.step(dt * 2);
 
     // ---- damage and healing ---------------------------------------------
     if (grabDamage > 0) {
@@ -2433,11 +2991,14 @@ class Input {
   read() {
     let throttle = 0;
     let steer = 0;
-    if (this.held(THROTTLE)) throttle += 1;
-    if (this.held(BRAKE)) throttle -= 1;
+    const gas = this.held(THROTTLE);
+    const brake = this.held(BRAKE);
+    if (gas) throttle += 1;
+    if (brake) throttle -= 1;
     if (this.held(LEFT)) steer -= 1;
     if (this.held(RIGHT)) steer += 1;
-    return { throttle, steer };
+    // Both at once holds the car on the brakes and lights up the tyres.
+    return { throttle, steer, burnout: gas && brake };
   }
 }
 
@@ -2653,6 +3214,8 @@ const SIDEWALK = '#41434c';
 const PARK = '#2c3b2b';
 const LOT = '#313239';
 const LINE = 'rgba(206,180,88,0.55)';
+const DASH = [26, 22];
+const DASH_PERIOD = DASH[0] + DASH[1];
 
 const TILE_WORLD = 1024;   // world units covered by one decal tile
 const TILE_PX = 512;       // half-resolution: blood does not need to be sharp
@@ -2751,6 +3314,34 @@ class DecalLayer {
           ctx.arc(sx, sy, sr, 0, TAU);
           ctx.fill();
         }
+      }
+    }
+  }
+
+  /** A tyre mark: a short smear of blood or black rubber on the tarmac. */
+  mark(m, frame) {
+    const half = Math.max(m.w, m.h);
+    const x0 = Math.floor((m.x - half) / TILE_WORLD);
+    const x1 = Math.floor((m.x + half) / TILE_WORLD);
+    const y0 = Math.floor((m.y - half) / TILE_WORLD);
+    const y1 = Math.floor((m.y + half) / TILE_WORLD);
+    const bloody = m.blood === undefined ? 1 : m.blood;
+    // Blood-soaked tyres paint dark red; clean ones lay black rubber.
+    const hue = 356;
+    const sat = Math.round(58 * bloody);
+    const light = Math.round(4 + 9 * bloody);
+    const alpha = Math.min(0.55, m.a * (0.55 + bloody * 0.45));
+
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        const t = this._tile(tx, ty, frame);
+        const ctx = t.ctx;
+        ctx.save();
+        ctx.translate(m.x, m.y);
+        ctx.rotate(m.ang);
+        ctx.fillStyle = `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`;
+        ctx.fillRect(-m.w * 0.5, -m.h * 0.5, m.w, m.h);
+        ctx.restore();
       }
     }
   }
@@ -2881,7 +3472,10 @@ class Renderer {
     this.drawGround(game, view);
     for (const s of game.gore.splats) this.decals.splat(s, this.frame);
     game.gore.splats.length = 0;
+    for (const m of game.marks) this.decals.mark(m, this.frame);
+    game.marks.length = 0;
     this.decals.draw(ctx, view, this.frame);
+    this.drawBlood(game);
     this.drawGore(game, view);
     this.drawPickups(game, view);
     this.drawFlame(game);
@@ -2917,19 +3511,28 @@ class Renderer {
     }
 
     // Lane markings down the middle of each street.
+    //
+    // A dash pattern restarts at the beginning of every subpath, so a line
+    // that starts at the edge of the view has a phase that moves with the
+    // camera - the dashes crawl along the road as you drive. Starting each
+    // line on a multiple of the dash period instead pins them to the world.
     ctx.strokeStyle = LINE;
     ctx.lineWidth = 3;
-    ctx.setLineDash([26, 22]);
+    ctx.setLineDash(DASH);
     ctx.beginPath();
+    const top = Math.floor(Math.max(0, view.y) / DASH_PERIOD) * DASH_PERIOD;
+    const bottom = Math.min(city.height, view.y + view.h);
     for (let cx = c0x; cx <= c1x + 1; cx++) {
       const x = cx * CELL;
-      ctx.moveTo(x, Math.max(0, view.y));
-      ctx.lineTo(x, Math.min(city.height, view.y + view.h));
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
     }
+    const left = Math.floor(Math.max(0, view.x) / DASH_PERIOD) * DASH_PERIOD;
+    const right = Math.min(city.width, view.x + view.w);
     for (let cy = c0y; cy <= c1y + 1; cy++) {
       const y = cy * CELL;
-      ctx.moveTo(Math.max(0, view.x), y);
-      ctx.lineTo(Math.min(city.width, view.x + view.w), y);
+      ctx.moveTo(left, y);
+      ctx.lineTo(right, y);
     }
     ctx.stroke();
     ctx.setLineDash([]);
@@ -3074,6 +3677,52 @@ class Renderer {
       ctx.drawImage(img, -s * 0.5, -s * 0.5, s, s);
     }
     this.worldTransform(game);
+  }
+
+  /**
+   * The wet blood, straight out of the fluid grid. One small image scaled up
+   * with smoothing: the grid is coarse, but liquid has no hard edges anyway,
+   * and the crisp marks come from the decal layer underneath.
+   */
+  drawBlood(game) {
+    const f = game.blood;
+    if (f.empty || f.wet < 0.04) return;
+    const n = f.n;
+
+    if (this.bloodCanvas === undefined || this.bloodCanvas.width !== n) {
+      this.bloodCanvas = document.createElement('canvas');
+      this.bloodCanvas.width = n;
+      this.bloodCanvas.height = n;
+      this.bloodCtx = this.bloodCanvas.getContext('2d');
+      this.bloodImage = this.bloodCtx.createImageData(n, n);
+    }
+
+    const px = this.bloodImage.data;
+    px.fill(0);
+    const d = f.d;
+    for (let j = f.bj0; j <= f.bj1; j++) {
+      const row = j * n;
+      for (let i = f.bi0; i <= f.bi1; i++) {
+        const v = d[i + row];
+        if (v <= 0.002) continue;
+        const a = clamp(v * 2.3 - 0.05, 0, 0.9);
+        if (a <= 0) continue;
+        const t = clamp(v, 0, 1);
+        const o = (i + row) * 4;
+        px[o] = 156 - 84 * t;       // thin blood is brighter, deep is near-black
+        px[o + 1] = 26 - 18 * t;
+        px[o + 2] = 24 - 12 * t;
+        px[o + 3] = a * 255;
+      }
+    }
+    this.bloodCtx.putImageData(this.bloodImage, 0, 0);
+
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'low';
+    ctx.drawImage(this.bloodCanvas, f.ox, f.oy, f.width, f.width);
+    ctx.restore();
   }
 
   drawPickups(game, view) {
@@ -3806,8 +4455,9 @@ function startRun() {
   paused = false;
 }
 
-function handleTouch() {
+function handleTouch(dt) {
   touch.layout(renderer.uw, renderer.uh, renderer.uiScale);
+  touch.tick(dt);
   const taps = touch.consumeTaps();
   if (taps.gear) {
     audio.resume();
@@ -3823,7 +4473,9 @@ function readInput() {
   const keys = input.read();
   if (keys.throttle !== 0 || keys.steer !== 0) return keys;
   const stick = touch.read(game.car);
-  return stick.active ? { throttle: stick.throttle, steer: stick.steer } : keys;
+  return stick.active
+    ? { throttle: stick.throttle, steer: stick.steer, burnout: stick.burnout }
+    : keys;
 }
 
 function handleKeys() {
@@ -3880,7 +4532,7 @@ function frame(now) {
   dt = Math.min(dt, 0.25);
 
   handleKeys();
-  handleTouch();
+  handleTouch(dt);
 
   if (!paused) {
     audio.beginFrame();

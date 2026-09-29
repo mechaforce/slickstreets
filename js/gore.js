@@ -8,7 +8,7 @@ import { SpatialHash } from './spatialhash.js';
 import { mulberry32, rr, clamp, TAU } from './util.js';
 import { CAR_LENGTH, CAR_WIDTH } from './car.js';
 
-export const MAX_CHUNKS = 3200;
+export const MAX_CHUNKS = 4600;
 
 export const MEAT = 0;
 export const BONE = 1;
@@ -62,7 +62,7 @@ export class GoreField {
       c.y = y + rr(rng, -6, 6);
       c.vx = Math.cos(a) * sp;
       c.vy = Math.sin(a) * sp;
-      c.r = kind === MEAT ? rr(rng, 4.5, 11) : rr(rng, 3, 6.5);
+      c.r = kind === MEAT ? rr(rng, 5, 13) : rr(rng, 3.2, 7);
       c.rot = rr(rng, 0, TAU);
       c.spin = rr(rng, -6, 6);
       c.type = kind;
@@ -71,9 +71,10 @@ export class GoreField {
       c.moving = true;
       c.age = 0;
     }
+    if (this.splats.length > 512) this.splats.shift();
     this.splats.push({
       x, y,
-      r: (kind === MEAT ? 34 : 22) + power * 0.06,
+      r: (kind === MEAT ? 40 : 25) + power * 0.07,
       tone: this.rng(),
       kind,
       dirx, diry,

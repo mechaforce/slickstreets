@@ -13,6 +13,8 @@ const REVERSE_ARC = 2.36; // radians, 135 degrees
 const DEADZONE = 0.18;
 const STEER_GAIN = 2.4;
 
+/** Hold the gear button this long and it becomes a burnout instead. */
+export const HOLD_FOR_BURNOUT = 0.3;
 export const STICK_RADIUS = 74;   // logical px from base to full deflection
 export const BUTTON_RADIUS = 52;
 
@@ -57,7 +59,7 @@ export class TouchControls {
     this.h = 0;
 
     this.stick = { id: -1, down: false, baseX: 0, baseY: 0, dx: 0, dy: 0 };
-    this.gear = { id: -1, x: 0, y: 0, r: BUTTON_RADIUS, down: false };
+    this.gear = { id: -1, x: 0, y: 0, r: BUTTON_RADIUS, down: false, heldFor: 0 };
     this.pause = { id: -1, x: 0, y: 0, r: 20, down: false };
     this.taps = { gear: false, pause: false };
 
@@ -73,6 +75,11 @@ export class TouchControls {
     target.addEventListener('pointerup', (e) => this._up(e), opts);
     target.addEventListener('pointercancel', (e) => this._up(e), opts);
     target.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  /** Holding the gear button down, rather than tapping it, does a burnout. */
+  get burnout() {
+    return this.enabled && this.gear.down && this.gear.heldFor > HOLD_FOR_BURNOUT;
   }
 
   /** Position the controls for the current screen, in logical HUD units. */
@@ -179,14 +186,23 @@ export class TouchControls {
     }
   }
 
+  /** Advance button hold timers. */
+  tick(dt) {
+    if (this.gear.down) this.gear.heldFor += dt;
+    else this.gear.heldFor = 0;
+  }
+
   /** Current throttle and steering, given what the car is doing. */
   read(car) {
-    if (!this.enabled || !this.stick.down) return { throttle: 0, steer: 0, active: false };
-    return stickToInput(
-      car.ang, car.speed,
-      this.stick.dx / STICK_RADIUS,
-      this.stick.dy / STICK_RADIUS,
-    );
+    const burning = this.burnout;
+    if (!this.enabled || (!this.stick.down && !burning)) {
+      return { throttle: 0, steer: 0, active: burning, burnout: burning };
+    }
+    const r = this.stick.down
+      ? stickToInput(car.ang, car.speed, this.stick.dx / STICK_RADIUS, this.stick.dy / STICK_RADIUS)
+      : { throttle: 0, steer: 0, active: true };
+    // While burning out the stick only steers - the throttle is pinned.
+    return { throttle: burning ? 0 : r.throttle, steer: r.steer, active: true, burnout: burning };
   }
 
   /** Button presses since the last call. */

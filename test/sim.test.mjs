@@ -9,6 +9,7 @@ import { createBot, botInput } from './bot.mjs';
 import { PickupField, PICKUP_KINDS, WIRE, WHEELS, FLAME } from '../js/pickups.js';
 import { CAR_WIDTH } from '../js/car.js';
 import { stickToInput, STICK_RADIUS } from '../js/touch.js';
+import { BloodField } from '../js/fluid.js';
 
 const STEP = 1 / 60;
 
@@ -432,4 +433,163 @@ test('joystick: it can actually drive the car', () => {
   assert.ok(Math.abs(g.car.ang - Math.PI / 2) < 0.3,
     `car should be heading south, is at ${(g.car.ang * 57.3).toFixed(0)} degrees`);
   assert.ok(g.car.speed > 100, 'and moving');
+});
+
+// ---------------------------------------------------------------------------
+// Wet blood: the fluid, and what it does to the car
+// ---------------------------------------------------------------------------
+
+test('fluid: blood flows the way it is pushed, and not the other way', () => {
+  const f = new BloodField();
+  f.anchor(5000, 5000);
+  f.add(5000, 5000, 3, 0, 0, 40);
+  for (let i = 0; i < 30; i++) {
+    f.addVelocity(5000, 5000, 900, 0, 30);
+    f.step(1 / 30);
+  }
+  const downstream = f.sample(5120, 5000);
+  const upstream = f.sample(4880, 5000);
+  assert.ok(downstream > 0.01, `blood should be carried downstream, got ${downstream.toFixed(3)}`);
+  assert.ok(downstream > upstream * 5, 'and not spread evenly in both directions');
+});
+
+test('fluid: a dry road costs nothing, and blood dries up on its own', () => {
+  const f = new BloodField();
+  f.anchor(0, 0);
+  assert.equal(f.empty, true, 'nothing to simulate on clean tarmac');
+  f.step(1 / 30);
+  assert.equal(f.wet, 0);
+
+  f.add(1000, 1000, 1, 0, 0, 30);
+  assert.equal(f.empty, false);
+  const fresh = f.wet || 1;
+  for (let i = 0; i < 30 * 60; i++) f.step(1 / 30);
+  assert.ok(f.wet < fresh * 0.2, `blood should dry over a minute, ${f.wet.toFixed(2)} left`);
+});
+
+test('fluid: only the bloody part of the grid is simulated', () => {
+  const f = new BloodField();
+  f.anchor(5000, 5000);
+  f.add(5000, 5000, 1, 0, 0, 30);
+  f.step(1 / 30);
+  const cells = (f.bi1 - f.bi0 + 1) * (f.bj1 - f.bj0 + 1);
+  assert.ok(cells < f.size * 0.05,
+    `one splash should not wake the whole grid (${cells} of ${f.size} cells)`);
+});
+
+test('fluid: the window follows the car and carries the blood with it', () => {
+  const f = new BloodField();
+  f.anchor(5000, 5000);
+  f.add(5000, 5000, 2, 0, 0, 40);
+  const before = f.sample(5000, 5000);
+  f.anchor(5600, 5000);   // drive east; the pool must stay where it was spilt
+  const after = f.sample(5000, 5000);
+  assert.ok(Math.abs(after - before) < 0.05,
+    `blood should stay at its world position (${before.toFixed(2)} -> ${after.toFixed(2)})`);
+
+  f.anchor(90000, 90000); // somewhere else entirely
+  assert.equal(f.sample(5000, 5000), 0, 'and be gone once it is far out of range');
+});
+
+test('blood: killing them makes the road slick under the car', () => {
+  const g = new Game(30);
+  g.start();
+  assert.equal(g.slip, 0, 'the road starts clean');
+  for (let i = 0; i < 14; i++) g.blood.add(g.car.x, g.car.y, 0.3, 0, 0, 24);
+  g.update(STEP, { throttle: 0, steer: 0 });
+  assert.ok(g.slip > 0.5, `a pile of bodies should leave a slick, got ${g.slip.toFixed(2)}`);
+});
+
+test('blood: a slick road makes the car slide instead of gripping', () => {
+  const drift = (slip) => {
+    const c = createCar(0, 0, 0);
+    c.gear = GEAR_HIGH;
+    c.vx = 420;
+    c.speed = 420;
+    let peak = 0;
+    for (let i = 0; i < 120; i++) {
+      updateCar(c, { throttle: 1, steer: 1 }, STEP, { slip });
+      let d = Math.atan2(c.vy, c.vx) - c.ang;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      peak = Math.max(peak, Math.abs(d));
+    }
+    return peak;
+  };
+  assert.ok(drift(0) < 0.01, 'a dry road gives no slide at all');
+  assert.ok(drift(1) > 0.2, `blood should break traction, got ${(drift(1) * 57.3).toFixed(0)} degrees`);
+  assert.ok(drift(1) > drift(0.5), 'and more blood should mean more slide');
+});
+
+test('blood: low gear can break traction on it, high gear cannot', () => {
+  const spin = (gear) => {
+    const c = createCar(0, 0, 0);
+    c.gear = gear;
+    let peak = 0;
+    for (let i = 0; i < 30; i++) {
+      updateCar(c, { throttle: 1, steer: 0 }, STEP, { slip: 1 });
+      peak = Math.max(peak, c.wheelspin);
+    }
+    return peak;
+  };
+  assert.ok(spin(GEAR_LOW) > 0.3, 'low gear has the torque to light them up');
+  assert.ok(spin(GEAR_HIGH) < spin(GEAR_LOW) * 0.5, 'high gear has not got the torque down low');
+});
+
+test('burnout: throttle and brake together spins the tyres on the spot', () => {
+  const c = createCar(0, 0, 0);
+  c.gear = GEAR_LOW;
+  let turned = 0;
+  let last = c.ang;
+  for (let i = 0; i < 180; i++) {
+    updateCar(c, { throttle: 0, steer: 1, burnout: true }, STEP, { slip: 0.9 });
+    let d = c.ang - last;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    turned += d;
+    last = c.ang;
+  }
+  assert.ok(c.wheelspin > 0.9, 'the wheels should be spinning');
+  assert.ok(Math.abs(turned) > Math.PI * 2, `should spin right round, turned ${(turned * 57.3).toFixed(0)} degrees`);
+  assert.ok(Math.hypot(c.x, c.y) < 260, `without going anywhere, moved ${Math.hypot(c.x, c.y).toFixed(0)}px`);
+});
+
+test('burnout: it throws the blood about and lays rubber', () => {
+  const g = new Game(31);
+  g.start();
+  g.car.gear = GEAR_LOW;
+  for (let i = 0; i < 14; i++) g.blood.add(g.car.x, g.car.y, 0.3, 0, 0, 26);
+  g.marks.length = 0;
+  run(g, 1.5, { throttle: 0, steer: 1, burnout: true });
+  assert.ok(g.car.wheelspin > 0.9, 'wheels spinning');
+  assert.ok(g.marks.length > 0, 'a burnout should leave marks on the road');
+  assert.ok(g.marks.some((m) => m.blood > 0.3), 'and in a pool of blood they should be bloody ones');
+  assert.ok(g.car.tyreBlood > 0.1, 'with blood picked up on the tyres');
+});
+
+test('tyres: driving through blood picks it up and trails it away', () => {
+  const g = new Game(32);
+  g.start();
+  g.car.ang = 0;
+  g.car.vx = 260;
+  g.car.speed = 260;
+  // A pool sitting on the road ahead.
+  for (let i = 0; i < 10; i++) g.blood.add(g.car.x + 40 + i * 12, g.car.y, 0.45, 0, 0, 26);
+  g.marks.length = 0;
+  run(g, 1.2, { throttle: 1, steer: 0 });
+  assert.ok(g.car.tyreBlood > 0.05, 'the tyres should come away bloody');
+  assert.ok(g.marks.length > 0, 'and lay a trail behind them');
+});
+
+test('gore: a kill throws off a good deal more than a handful of chunks', () => {
+  const g = new Game(33);
+  g.start();
+  g.car.gear = GEAR_HIGH;
+  run(g, 6, { throttle: 1, steer: 0 });
+  const before = g.gore.live;
+  const kills = g.kills;
+  mob(g, 20, 30);
+  run(g, 0.5, { throttle: 1, steer: 0 });
+  const perKill = (g.gore.live - before) / Math.max(1, g.kills - kills);
+  assert.ok(perKill > 6, `expected a proper mess per kill, got ${perKill.toFixed(1)} chunks`);
 });

@@ -15,8 +15,8 @@ export const SKELETON = 1;
  * they get to you first and claw harder.
  */
 export const KINDS = [
-  { name: 'zombie',   radius: 9,   speed: [42, 74],  killSpeed: 88, mass: 1.0, damage: 3.2, drag: 1.0, gore: 6 },
-  { name: 'skeleton', radius: 7.5, speed: [86, 128], killSpeed: 52, mass: 0.55, damage: 5.0, drag: 0.6, gore: 3 },
+  { name: 'zombie',   radius: 9,   speed: [42, 74],  killSpeed: 88, mass: 1.0, damage: 3.2, drag: 1.0, gore: 10 },
+  { name: 'skeleton', radius: 7.5, speed: [86, 128], killSpeed: 52, mass: 0.55, damage: 5.0, drag: 0.6, gore: 6 },
 ];
 
 const ACTIVE_RADIUS = 1750;   // full-rate AI inside this radius of the car

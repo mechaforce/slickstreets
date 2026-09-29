@@ -55,10 +55,13 @@ export class Input {
   read() {
     let throttle = 0;
     let steer = 0;
-    if (this.held(THROTTLE)) throttle += 1;
-    if (this.held(BRAKE)) throttle -= 1;
+    const gas = this.held(THROTTLE);
+    const brake = this.held(BRAKE);
+    if (gas) throttle += 1;
+    if (brake) throttle -= 1;
     if (this.held(LEFT)) steer -= 1;
     if (this.held(RIGHT)) steer += 1;
-    return { throttle, steer };
+    // Both at once holds the car on the brakes and lights up the tyres.
+    return { throttle, steer, burnout: gas && brake };
   }
 }
