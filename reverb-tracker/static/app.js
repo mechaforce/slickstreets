@@ -389,7 +389,8 @@ function cardHtml(l) {
     market = `<div class="tiny">${esc(l.label === "Unrated" ? "Model not identified, so no like-for-like comparison." : "Not rated: " + l.confidence_reason + ".")}</div>`;
   }
   const est = l.estimate && l.comp_basis !== "Reverb price guide" ? `<div class="tiny" title="Reverb's estimate of what this model sells for in this condition">Reverb price guide ${money(l.estimate.low)}–${money(l.estimate.high)} · ${signedPct(l.pct_vs_estimate)}</div>` : "";
-  const meta = [l.condition_name, l.year_text, l.finish].filter(Boolean).map(esc).join(" · ");
+  const yearOk = /\b(19|20)\d{2}\b|\b\d0'?s\b|current/i.test(l.year_text || "");
+  const meta = [l.condition_name, yearOk ? l.year_text : "", l.finish].filter(Boolean).map(esc).join(" · ");
   return `<article class="card">
     <a href="${esc(l.url)}" target="_blank" rel="noopener">${l.photo ? `<img class="ph" loading="lazy" src="${esc(l.photo)}" alt="">` : `<div class="ph"></div>`}</a>
     <div class="body">
