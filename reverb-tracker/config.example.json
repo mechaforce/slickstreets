@@ -1,0 +1,8 @@
+{
+  "port": 8765,
+  "check_interval_hours": 6,
+  "currency": "USD",
+  "region": "US_CON",
+  "reverb_token": "",
+  "password": ""
+}
